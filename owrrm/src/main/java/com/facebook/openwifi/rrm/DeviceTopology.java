@@ -8,8 +8,10 @@
 
 package com.facebook.openwifi.rrm;
 
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
 import io.swagger.v3.oas.annotations.Hidden;
 
@@ -19,6 +21,14 @@ import io.swagger.v3.oas.annotations.Hidden;
  */
 public class DeviceTopology extends TreeMap<String, Set<String>> {
 	private static final long serialVersionUID = -1636132862513920700L;
+
+	public DeviceTopology() {}
+
+	public DeviceTopology(DeviceTopology source) {
+		for (Map.Entry<String, Set<String>> entry : source.entrySet()) {
+			put(entry.getKey(), new TreeSet<>(entry.getValue()));
+		}
+	}
 
 	@Hidden /* prevent Jackson object mapper from generating "empty" property */
 	@Override

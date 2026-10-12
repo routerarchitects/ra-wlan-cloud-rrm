@@ -40,6 +40,46 @@ paths:
             application/json:
               schema:
                 type: object
+  /api/v1/device/{serialNumber}/zone:
+    get:
+      tags:
+      - Config
+      summary: Get device RF zone
+      description: Returns the RF zone for a device serial number from RRM's synchronized
+        topology.
+      operationId: getDeviceZone
+      parameters:
+      - name: serialNumber
+        in: path
+        description: The device serial number
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: Device RF zone
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceZoneResult'
+        "400":
+          description: Invalid serial number
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Zone not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /api/v1/getDeviceConfig:
     get:
       tags:
@@ -83,7 +123,8 @@ paths:
       tags:
       - Config
       summary: Get device topology
-      description: Returns the device topology.
+      description: Returns the device topology. Internal service access only; valid
+        internal credentials are required.
       operationId: getTopology
       responses:
         "200":
@@ -92,6 +133,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeviceTopology'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /api/v1/modifyDeviceApConfig:
     post:
       tags:
@@ -377,7 +424,8 @@ paths:
       tags:
       - Config
       summary: Set device topology
-      description: Set the device topology.
+      description: Set the device topology. Internal service access only; valid
+        internal credentials are required.
       operationId: setTopology
       requestBody:
         description: The device topology
@@ -391,6 +439,12 @@ paths:
           description: Success
         "400":
           description: Bad Request
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 components:
   schemas:
     Algorithm:
@@ -501,6 +555,26 @@ components:
           $ref: '#/components/schemas/DeviceConfig'
     DeviceTopology:
       type: object
+    DeviceZoneResult:
+      type: object
+      description: Device RF zone lookup result
+      properties:
+        serialNumber:
+          type: string
+          description: The device serial number
+          example: AP-001
+        zone:
+          type: string
+          description: The RF zone
+          example: Lobby
+    ErrorResponse:
+      type: object
+      description: Error response
+      properties:
+        error:
+          type: string
+          description: The error message
+          example: Zone not found
     ChannelAllocation:
       type: object
       properties:

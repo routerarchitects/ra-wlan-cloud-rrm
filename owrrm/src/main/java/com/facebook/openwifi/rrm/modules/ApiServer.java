@@ -178,6 +178,35 @@ public class ApiServer implements Runnable {
 	/** The module start time (real time), in ms. */
 	private long startTimeMs;
 
+	/** Device zone lookup API response. */
+	@Schema(description = "Device RF zone lookup result")
+	public static class DeviceZoneResult {
+		/** The device serial number. */
+		@Schema(description = "The device serial number", example = "AP-001")
+		public String serialNumber;
+
+		/** The RF zone. */
+		@Schema(description = "The RF zone", example = "Lobby")
+		public String zone;
+
+		/** Constructor. */
+		public DeviceZoneResult(String serialNumber, String zone) {
+			this.serialNumber = serialNumber;
+			this.zone = zone;
+		}
+	}
+
+	/** Error API response. */
+	@Schema(description = "Error response")
+	public static class ErrorResponse {
+		/** The error message. */
+		@Schema(description = "The error message", example = "Zone not found")
+		public String error;
+
+		/** Constructor. */
+		public ErrorResponse(String error) { this.error = error; }
+	}
+
 	/** Constructor. */
 	public ApiServer(
 		ApiServerParams params,
@@ -288,6 +317,10 @@ public class ApiServer implements Runnable {
 		service.get("/api/v1/getTopology", new GetTopologyEndpoint());
 		service.post("/api/v1/setTopology", new SetTopologyEndpoint());
 		service.get(
+			"/api/v1/device/:serialNumber/zone",
+			new GetDeviceZoneEndpoint()
+		);
+		service.get(
 			"/api/v1/getDeviceLayeredConfig",
 			new GetDeviceLayeredConfigEndpoint()
 		);
@@ -338,6 +371,52 @@ public class ApiServer implements Runnable {
 			: String.format("%s?%s", path, queryString);
 	}
 
+	/** Return true if the request arrived on the internal listener. */
+	private boolean isInternalRequest(Request request) {
+		int port = request.raw().getLocalPort();
+		return port > 0 && port == params.internalHttpPort;
+	}
+
+	/** Return true if the request has valid internal service credentials. */
+	private boolean hasValidInternalServiceAuth(Request request) {
+		String internalName = request.headers("X-INTERNAL-NAME");
+		if (internalName == null) {
+			return false;
+		}
+
+		String apiKey = request.headers("X-API-KEY");
+		return apiKey != null && apiKey.equals(serviceKey);
+	}
+
+	/** Return true if the endpoint performs its own internal service auth. */
+	private boolean hasRouteLevelInternalServiceAuth(Request request) {
+		String path = request.pathInfo();
+		return path.equals("/api/v1/getTopology") ||
+			path.equals("/api/v1/setTopology") ||
+			path.matches("^/api/v1/device/[^/]+/zone$");
+	}
+
+	/** Return true if the serial number matches Analytics routerId validation. */
+	private boolean isValidPathSafeSerialNumber(String serialNumber) {
+		if (serialNumber == null ||
+			serialNumber.isEmpty() ||
+			serialNumber.length() > 64) {
+			return false;
+		}
+
+		for (int i = 0; i < serialNumber.length(); i++) {
+			char c = serialNumber.charAt(i);
+			if (!((c >= '0' && c <= '9') ||
+				(c >= 'A' && c <= 'Z') ||
+				(c >= 'a' && c <= 'z') ||
+				c == '-' ||
+				c == '_')) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	/**
 	 * Perform OpenWiFi authentication via tokens (external) and API keys
 	 * (internal).
@@ -346,17 +425,10 @@ public class ApiServer implements Runnable {
 	 * HTTP 403 response and return false.
 	 */
 	private boolean performOpenWifiAuth(Request request, Response response) {
-		int port = request.port();
-		boolean internal = port > 0 && port == params.internalHttpPort;
-		if (internal) {
-			String internalName = request.headers("X-INTERNAL-NAME");
-			if (internalName != null) {
-				// Internal request, validate "X-API-KEY"
-				String apiKey = request.headers("X-API-KEY");
-				if (apiKey != null && apiKey.equals(serviceKey)) {
-					// auth success
-					return true;
-				}
+		if (isInternalRequest(request)) {
+			if (hasValidInternalServiceAuth(request)) {
+				// auth success
+				return true;
 			}
 		} else {
 			// External request, validate token:
@@ -437,7 +509,10 @@ public class ApiServer implements Runnable {
 		// OpenWifi auth (if enabled)
 		if (params.useOpenWifiAuth) {
 			// Only protect API endpoints
-			if (request.pathInfo().startsWith("/api/")) {
+			if (
+				request.pathInfo().startsWith("/api/") &&
+				!hasRouteLevelInternalServiceAuth(request)
+			) {
 				this.performOpenWifiAuth(request, response);
 			}
 		}
@@ -503,6 +578,13 @@ public class ApiServer implements Runnable {
 	private String getOpenApiJson(Request request, Response response) {
 		response.type(MediaType.APPLICATION_JSON);
 		return Json.pretty(getOpenApi());
+	}
+
+	/** Return a JSON error response. */
+	private String jsonError(Response response, int status, String error) {
+		response.status(status);
+		response.type(MediaType.APPLICATION_JSON);
+		return gson.toJson(new ErrorResponse(error));
 	}
 
 	@Path("/api/v1/system")
@@ -810,7 +892,7 @@ public class ApiServer implements Runnable {
 		@Produces({ MediaType.APPLICATION_JSON })
 		@Operation(
 			summary = "Get device topology",
-			description = "Returns the device topology.",
+			description = "Returns the device topology. Internal service access only; valid internal credentials are required.",
 			operationId = "getTopology",
 			tags = { "Config" },
 			responses = {
@@ -820,6 +902,13 @@ public class ApiServer implements Runnable {
 					content = @Content(
 						schema = @Schema(implementation = DeviceTopology.class)
 					)
+				),
+				@ApiResponse(
+					responseCode = "403",
+					description = "Forbidden",
+					content = @Content(
+						schema = @Schema(implementation = ErrorResponse.class)
+					)
 				)
 			}
 		)
@@ -828,6 +917,17 @@ public class ApiServer implements Runnable {
 			@Parameter(hidden = true) Request request,
 			@Parameter(hidden = true) Response response
 		) {
+			if (!isInternalRequest(request)) {
+				return jsonError(
+					response,
+					403,
+					"Endpoint restricted to internal inter-service communication"
+				);
+			}
+			if (!hasValidInternalServiceAuth(request)) {
+				return jsonError(response, 403, "Forbidden");
+			}
+
 			response.type(MediaType.APPLICATION_JSON);
 			return deviceDataManager.getTopologyJson();
 		}
@@ -839,7 +939,7 @@ public class ApiServer implements Runnable {
 		@Produces({ MediaType.APPLICATION_JSON })
 		@Operation(
 			summary = "Set device topology",
-			description = "Set the device topology.",
+			description = "Set the device topology. Internal service access only; valid internal credentials are required.",
 			operationId = "setTopology",
 			tags = { "Config" },
 			requestBody = @RequestBody(
@@ -854,7 +954,14 @@ public class ApiServer implements Runnable {
 			),
 			responses = {
 				@ApiResponse(responseCode = "200", description = "Success"),
-				@ApiResponse(responseCode = "400", description = "Bad Request")
+				@ApiResponse(responseCode = "400", description = "Bad Request"),
+				@ApiResponse(
+					responseCode = "403",
+					description = "Forbidden",
+					content = @Content(
+						schema = @Schema(implementation = ErrorResponse.class)
+					)
+				)
 			}
 		)
 		@Override
@@ -862,6 +969,17 @@ public class ApiServer implements Runnable {
 			@Parameter(hidden = true) Request request,
 			@Parameter(hidden = true) Response response
 		) {
+			if (!isInternalRequest(request)) {
+				return jsonError(
+					response,
+					403,
+					"Endpoint restricted to internal inter-service communication"
+				);
+			}
+			if (!hasValidInternalServiceAuth(request)) {
+				return jsonError(response, 403, "Forbidden");
+			}
+
 			// TODO - block if "ProvMonitorParams.useVenues" is enabled?
 			try {
 				DeviceTopology topology =
@@ -878,6 +996,86 @@ public class ApiServer implements Runnable {
 				return e.getMessage();
 			}
 			return "";
+		}
+	}
+
+	@Path("/api/v1/device/{serialNumber}/zone")
+	public class GetDeviceZoneEndpoint implements Route {
+		@GET
+		@Produces({ MediaType.APPLICATION_JSON })
+		@Operation(
+			summary = "Get device RF zone",
+			description = "Returns the RF zone for a device serial number from RRM's synchronized topology.",
+			operationId = "getDeviceZone",
+			tags = { "Config" },
+			parameters = {
+				@Parameter(
+					name = "serialNumber",
+					description = "The device serial number",
+					in = ParameterIn.PATH,
+					schema = @Schema(type = "string"),
+					required = true
+				)
+			},
+			responses = {
+				@ApiResponse(
+					responseCode = "200",
+					description = "Device RF zone",
+					content = @Content(
+						schema = @Schema(implementation = DeviceZoneResult.class)
+					)
+				),
+				@ApiResponse(
+					responseCode = "400",
+					description = "Invalid serial number",
+					content = @Content(
+						schema = @Schema(implementation = ErrorResponse.class)
+					)
+				),
+				@ApiResponse(
+					responseCode = "403",
+					description = "Forbidden",
+					content = @Content(
+						schema = @Schema(implementation = ErrorResponse.class)
+					)
+				),
+				@ApiResponse(
+					responseCode = "404",
+					description = "Zone not found",
+					content = @Content(
+						schema = @Schema(implementation = ErrorResponse.class)
+					)
+				)
+			}
+		)
+		@Override
+		public String handle(
+			@Parameter(hidden = true) Request request,
+			@Parameter(hidden = true) Response response
+		) {
+			if (!isInternalRequest(request)) {
+				return jsonError(
+					response,
+					403,
+					"Endpoint restricted to internal inter-service communication"
+				);
+			}
+			if (!hasValidInternalServiceAuth(request)) {
+				return jsonError(response, 403, "Forbidden");
+			}
+
+			String serialNumber = request.params(":serialNumber");
+			if (!isValidPathSafeSerialNumber(serialNumber)) {
+				return jsonError(response, 400, "Invalid serial number");
+			}
+
+			String zone = deviceDataManager.getZoneForSerial(serialNumber);
+			if (zone == null) {
+				return jsonError(response, 404, "Zone not found");
+			}
+
+			response.type(MediaType.APPLICATION_JSON);
+			return gson.toJson(new DeviceZoneResult(serialNumber, zone));
 		}
 	}
 
