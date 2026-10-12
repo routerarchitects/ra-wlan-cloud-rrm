@@ -337,6 +337,23 @@ public class ApiServerTest {
 				.asString()
 				.getStatus()
 		);
+
+		String validTopologyJson = deviceDataManager.getTopologyJson();
+		resp = Unirest.post(url)
+			.header("X-INTERNAL-NAME", "internal_name")
+			.header("X-API-KEY", validKey)
+			.body("{\"zone-1\":null}")
+			.asString();
+		assertEquals(400, resp.getStatus());
+		assertEquals(
+			"Device list cannot be null for zone 'zone-1'",
+			resp.getBody()
+		);
+		assertEquals(validTopologyJson, deviceDataManager.getTopologyJson());
+		assertEquals(
+			"test-zone",
+			deviceDataManager.getZoneForSerial("aaaaaaaaaaa")
+		);
 	}
 
 	@Test

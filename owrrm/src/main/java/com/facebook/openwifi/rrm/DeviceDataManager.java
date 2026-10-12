@@ -197,21 +197,29 @@ public class DeviceDataManager {
 	/** Validate the topology, throwing IllegalArgumentException upon error. */
 	private void validateTopology(DeviceTopology topo) {
 		if (topo == null) {
-			throw new NullPointerException();
+			throw new IllegalArgumentException("Topology cannot be null");
 		}
 
 		Map<String, String> deviceToZone = new HashMap<>();
 		for (Map.Entry<String, Set<String>> entry : topo.entrySet()) {
 			String zone = entry.getKey();
-			if (zone.isEmpty()) {
+			if (zone == null || zone.isEmpty()) {
 				throw new IllegalArgumentException(
-					"Empty zone name in topology"
+					"Zone name cannot be null or empty"
+				);
+			}
+			if (entry.getValue() == null) {
+				throw new IllegalArgumentException(
+					String.format(
+						"Device list cannot be null for zone '%s'",
+						zone
+					)
 				);
 			}
 			for (String serialNumber : entry.getValue()) {
-				if (serialNumber.isEmpty()) {
+				if (serialNumber == null || serialNumber.isEmpty()) {
 					throw new IllegalArgumentException(
-						String.format("Empty serial number in zone '%s'", zone)
+						"Device serial number cannot be null or empty"
 					);
 				}
 				String existingZone = deviceToZone.get(serialNumber);
@@ -294,8 +302,8 @@ public class DeviceDataManager {
 	 * mutate it concurrently while this method is copying it.
 	 */
 	public void setTopology(DeviceTopology topo) {
+		validateTopology(topo);
 		DeviceTopology topologyCopy = new DeviceTopology(topo);
-		validateTopology(topologyCopy);
 		Map<String, String> newSerialToZone = buildSerialToZone(topologyCopy);
 
 		Lock l = topologyLock.writeLock();

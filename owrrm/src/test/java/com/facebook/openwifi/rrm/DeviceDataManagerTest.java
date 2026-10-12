@@ -19,6 +19,7 @@ import java.io.File;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CountDownLatch;
@@ -110,31 +111,60 @@ public class DeviceDataManagerTest {
 		DeviceDataManager deviceDataManager = new DeviceDataManager();
 
 		// Null topology
-		assertThrows(
-			NullPointerException.class,
-			() -> {
-				deviceDataManager.setTopology(null);
-			}
+		IllegalArgumentException exception = assertThrows(
+			IllegalArgumentException.class,
+			() -> deviceDataManager.setTopology(null)
+		);
+		assertEquals("Topology cannot be null", exception.getMessage());
+
+		// Null device list
+		final DeviceTopology topologyNullDevices = new DeviceTopology();
+		topologyNullDevices.put(zone, null);
+		exception = assertThrows(
+			IllegalArgumentException.class,
+			() -> deviceDataManager.setTopology(topologyNullDevices)
+		);
+		assertEquals(
+			"Device list cannot be null for zone 'test-zone'",
+			exception.getMessage()
 		);
 
 		// Empty zone name
 		final DeviceTopology topologyEmptyZone = new DeviceTopology();
 		topologyEmptyZone.put("", new TreeSet<>(Arrays.asList(deviceA)));
-		assertThrows(
+		exception = assertThrows(
 			IllegalArgumentException.class,
-			() -> {
-				deviceDataManager.setTopology(topologyEmptyZone);
-			}
+			() -> deviceDataManager.setTopology(topologyEmptyZone)
+		);
+		assertEquals(
+			"Zone name cannot be null or empty",
+			exception.getMessage()
 		);
 
 		// Empty serial number
 		final DeviceTopology topologyEmptySerial = new DeviceTopology();
 		topologyEmptySerial.put(zone, new TreeSet<>(Arrays.asList("")));
-		assertThrows(
+		exception = assertThrows(
 			IllegalArgumentException.class,
-			() -> {
-				deviceDataManager.setTopology(topologyEmptySerial);
-			}
+			() -> deviceDataManager.setTopology(topologyEmptySerial)
+		);
+		assertEquals(
+			"Device serial number cannot be null or empty",
+			exception.getMessage()
+		);
+
+		// Null serial number
+		final Set<String> devicesWithNullSerial = new HashSet<>();
+		devicesWithNullSerial.add(null);
+		final DeviceTopology topologyNullSerial = new DeviceTopology();
+		topologyNullSerial.put(zone, devicesWithNullSerial);
+		exception = assertThrows(
+			IllegalArgumentException.class,
+			() -> deviceDataManager.setTopology(topologyNullSerial)
+		);
+		assertEquals(
+			"Device serial number cannot be null or empty",
+			exception.getMessage()
 		);
 
 		// Same device in multiple zones
@@ -142,11 +172,18 @@ public class DeviceDataManagerTest {
 		final String zone2 = zone + "-copy";
 		topologyDupSerial.put(zone, new TreeSet<>(Arrays.asList(deviceA)));
 		topologyDupSerial.put(zone2, new TreeSet<>(Arrays.asList(deviceA)));
-		assertThrows(
+		exception = assertThrows(
 			IllegalArgumentException.class,
-			() -> {
-				deviceDataManager.setTopology(topologyDupSerial);
-			}
+			() -> deviceDataManager.setTopology(topologyDupSerial)
+		);
+		assertEquals(
+			String.format(
+				"Device '%s' in multiple zones ('%s', '%s')",
+				deviceA,
+				zone,
+				zone2
+			),
+			exception.getMessage()
 		);
 	}
 
@@ -236,6 +273,38 @@ public class DeviceDataManagerTest {
 
 	@Test
 	@Order(7)
+	void testRejectedTopologyUpdatePreservesExistingTopology()
+		throws Exception {
+		final String zoneA = "test-zone-A";
+		final String zoneB = "test-zone-B";
+		final String deviceA = "aaaaaaaaaa01";
+		final String deviceB = "bbbbbbbbbb01";
+
+		DeviceDataManager deviceDataManager = new DeviceDataManager();
+		DeviceTopology topology = new DeviceTopology();
+		topology.put(zoneA, new TreeSet<>(Arrays.asList(deviceA)));
+		deviceDataManager.setTopology(topology);
+		String originalTopologyJson = deviceDataManager.getTopologyJson();
+
+		DeviceTopology invalidTopology = new DeviceTopology();
+		invalidTopology.put(zoneB, null);
+		IllegalArgumentException exception = assertThrows(
+			IllegalArgumentException.class,
+			() -> deviceDataManager.setTopology(invalidTopology)
+		);
+		assertEquals(
+			"Device list cannot be null for zone 'test-zone-B'",
+			exception.getMessage()
+		);
+
+		assertEquals(originalTopologyJson, deviceDataManager.getTopologyJson());
+		assertEquals(zoneA, deviceDataManager.getZoneForSerial(deviceA));
+		assertNull(deviceDataManager.getZoneForSerial(deviceB));
+		assertFalse(deviceDataManager.isZoneInTopology(zoneB));
+	}
+
+	@Test
+	@Order(8)
 	void testReverseZoneIndexFromDisk(@TempDir Path tempDir) throws Exception {
 		final String zone = "test-zone";
 		final String device = "aaaaaaaaaa01";
@@ -252,7 +321,7 @@ public class DeviceDataManagerTest {
 	}
 
 	@Test
-	@Order(8)
+	@Order(9)
 	void testConcurrentTopologyUpdatesAndLookups() throws Exception {
 		final String zoneA = "test-zone-A";
 		final String zoneB = "test-zone-B";
