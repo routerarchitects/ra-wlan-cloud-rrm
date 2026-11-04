@@ -9,6 +9,8 @@
 package com.facebook.openwifi.rrm.modules;
 
 import java.util.HashMap;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -23,7 +25,13 @@ import org.slf4j.LoggerFactory;
 import com.facebook.openwifi.cloudsdk.UCentralApConfiguration;
 import com.facebook.openwifi.cloudsdk.UCentralClient;
 import com.facebook.openwifi.cloudsdk.UCentralUtils;
+import com.facebook.openwifi.cloudsdk.UCentralConstants;
+import com.facebook.openwifi.cloudsdk.models.ap.Capabilities;
+import com.facebook.openwifi.cloudsdk.models.gw.DeviceCapabilities;
+import com.facebook.openwifi.cloudsdk.models.gw.CommandInfo;
 import com.facebook.openwifi.cloudsdk.models.gw.DeviceWithStatus;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonElement;
 import com.facebook.openwifi.rrm.DeviceConfig;
 import com.facebook.openwifi.rrm.DeviceDataManager;
 import com.facebook.openwifi.rrm.RRMConfig.ModuleConfig.ConfigManagerParams;
@@ -157,7 +165,7 @@ public class ConfigManager implements Runnable {
 	}
 
 	/** Run single iteration of application logic. */
-	private void runImpl() {
+	void runImpl() {
 		while (!client.isInitialized()) {
 			logger.trace("Waiting for ucentral client");
 			try {
@@ -194,6 +202,11 @@ public class ConfigManager implements Runnable {
 			);
 			// Update the device only when it is still connected
 			if (!device.connected) {
+				String zone =
+					deviceDataManager.getDeviceZone(device.serialNumber);
+				if (zone != null && zonesToUpdateCopy.contains(zone)) {
+					zonesToUpdate.add(zone);
+				}
 				logger.info(
 					"Device {} is disconnected, skipping...",
 					device.serialNumber
@@ -252,6 +265,9 @@ public class ConfigManager implements Runnable {
 						device.serialNumber,
 						(now - data.lastConfigTimeNs) / 1_000_000_000L
 					);
+					if (isEvent) {
+						zonesToUpdate.add(deviceZone);
+					}
 					continue;
 				} else {
 					devicesNeedingUpdate
@@ -291,8 +307,36 @@ public class ConfigManager implements Runnable {
 					"Device {}: sending new configuration...",
 					serialNumber
 				);
-				data.lastConfigTimeNs = System.nanoTime();
-				client.configure(serialNumber, entry.getValue());
+				try {
+					CommandInfo result =
+						client.configure(serialNumber, entry.getValue());
+					if (
+						UCentralUtils.isCommandAccepted(
+							result,
+							serialNumber,
+							"configure"
+						)
+					) {
+						data.lastConfigTimeNs = System.nanoTime();
+					} else {
+						logger.error(
+							"Device {}: configuration command failed; retaining update",
+							serialNumber
+						);
+						queueZoneAndWakeUp(
+							deviceDataManager.getDeviceZone(serialNumber)
+						);
+					}
+				} catch (RuntimeException e) {
+					logger.error(
+						"Device {}: configuration delivery failed",
+						serialNumber,
+						e
+					);
+					queueZoneAndWakeUp(
+						deviceDataManager.getDeviceZone(serialNumber)
+					);
+				}
 			}
 		}
 	}
@@ -313,7 +357,7 @@ public class ConfigManager implements Runnable {
 	 * If any changes are needed, modify the config and return true.
 	 * Otherwise, return false.
 	 */
-	private boolean applyRRMConfig(
+	boolean applyRRMConfig(
 		String serialNumber,
 		UCentralApConfiguration config
 	) {
@@ -359,7 +403,228 @@ public class ConfigManager implements Runnable {
 			);
 		}
 
+		if (
+			deviceConfig.userChannelWidths != null &&
+				deviceConfig.userChannelWidths
+					.containsKey(UCentralConstants.BAND_2G)
+		) {
+			int width =
+				deviceConfig.userChannelWidths.get(UCentralConstants.BAND_2G);
+			try {
+				DeviceCapabilities capabilities =
+					client.getCapabilities(serialNumber);
+				validate2gBandwidth(config, deviceConfig, capabilities, width);
+				modified |= UCentralUtils.setRadioConfigField(
+					serialNumber,
+					config,
+					"channel-width",
+					Collections.singletonMap(UCentralConstants.BAND_2G, width)
+				);
+			} catch (RuntimeException e) {
+				logger.error(
+					"Device {}: cannot apply bandwidth: {}",
+					serialNumber,
+					e.getMessage()
+				);
+				queueZoneAndWakeUp(
+					deviceDataManager.getDeviceZone(serialNumber)
+				);
+				return false;
+			}
+		}
 		return modified;
+	}
+
+	/** Persist a validated manual selection and enqueue the existing zone delivery pipeline. */
+	public synchronized boolean set2gBandwidth(
+		DeviceWithStatus device,
+		int width
+	) {
+		String serial = device.serialNumber;
+		DeviceConfig settings = deviceDataManager.getDeviceConfig(serial);
+		String zone = deviceDataManager.getDeviceZone(serial);
+		if (
+			!params.configEnabled || settings == null ||
+				!Boolean.TRUE.equals(settings.enableConfig) ||
+				!Boolean.TRUE.equals(settings.enableRRM) || zone == null
+		) {
+			throw new IllegalStateException(
+				"Configuration updates are disabled or the device has no RRM zone"
+			);
+		}
+		if (!device.connected) {
+			throw new IllegalStateException("Device is offline");
+		}
+		if (device.configuration == null) {
+			throw new IllegalArgumentException(
+				"Device radio configuration is unavailable"
+			);
+		}
+		UCentralApConfiguration config =
+			new UCentralApConfiguration(device.configuration);
+		validate2gBandwidth(
+			config,
+			settings,
+			client.getCapabilities(serial),
+			width
+		);
+		boolean changed = UCentralUtils.setRadioConfigField(
+			serial,
+			config,
+			"channel-width",
+			Collections.singletonMap(UCentralConstants.BAND_2G, width)
+		);
+		// AP maps follow the existing whole-field layer precedence. Preserve the
+		// effective values of other bands when creating the AP override.
+		deviceDataManager.updateDeviceApConfig(configs -> {
+			DeviceConfig ap =
+				configs.computeIfAbsent(serial, key -> new DeviceConfig());
+			Map<String, Integer> widths = new HashMap<>();
+			if (ap.userChannelWidths != null) {
+				widths.putAll(ap.userChannelWidths);
+			} else if (settings.userChannelWidths != null) {
+				widths.putAll(settings.userChannelWidths);
+			}
+			widths.put(UCentralConstants.BAND_2G, width);
+			ap.userChannelWidths = widths;
+		});
+		if (changed) {
+			queueZoneAndWakeUp(zone);
+		}
+		return changed;
+	}
+
+	/** Fail closed when radio, width or regulatory channel support cannot be established. */
+	static void validate2gBandwidth(
+		UCentralApConfiguration config,
+		DeviceConfig settings,
+		DeviceCapabilities capabilities,
+		int width
+	) {
+		if (width != 20 && width != 40) {
+			throw new IllegalArgumentException(
+				"Only HT20 and HT40 are supported"
+			);
+		}
+		List<Integer> allowed =
+			settings.allowedChannelWidths == null
+				? null
+				: settings.allowedChannelWidths.get(UCentralConstants.BAND_2G);
+		if (allowed != null && !allowed.contains(width)) {
+			throw new IllegalArgumentException(
+				"Bandwidth is disallowed by allowedChannelWidths"
+			);
+		}
+		JsonObject target = null;
+		for (int index = 0; index < config.getRadioCount(); index++) {
+			JsonObject radio = config.getRadioConfig(index);
+			if (
+				radio != null && radio.has("band") &&
+					"2G".equals(radio.get("band").getAsString())
+			) {
+				if (target != null) {
+					throw new IllegalArgumentException(
+						"Multiple 2.4 GHz radios cannot be targeted unambiguously"
+					);
+				}
+				target = radio;
+			}
+		}
+		if (target == null) {
+			throw new IllegalArgumentException("Device has no 2.4 GHz radio");
+		}
+		Capabilities.Phy phy = null;
+		if (
+			capabilities != null && capabilities.capabilities != null &&
+				capabilities.capabilities.wifi != null
+		) {
+			for (
+				Capabilities.Phy candidate : capabilities.capabilities.wifi
+					.values()
+			) {
+				if (
+					candidate != null && candidate.band != null &&
+						Arrays.asList(candidate.band).contains("2G")
+				) {
+					if (phy != null) {
+						throw new IllegalArgumentException(
+							"Ambiguous 2.4 GHz device capabilities"
+						);
+					}
+					phy = candidate;
+				}
+			}
+		}
+		if (
+			phy == null || phy.htmode == null || phy.channels == null ||
+				Arrays.stream(phy.htmode).noneMatch(mode -> mode != null && mode.matches("(?:HT|VHT|HE|EHT)" + width + "[+-]?"))
+		) {
+			throw new IllegalArgumentException(
+				"Bandwidth is unsupported or device capabilities are unavailable"
+			);
+		}
+		if (
+			!target.has("country") || phy.country == null ||
+				!phy.country.equalsIgnoreCase(target.get("country").getAsString())
+		) {
+			throw new IllegalArgumentException(
+				"Radio country must match the device regulatory capabilities"
+			);
+		}
+		Set<Integer> channels = new HashSet<>();
+		for (int channel : phy.channels) {
+			if (channel >= 1 && channel <= 14) {
+				channels.add(channel);
+			}
+		}
+		Integer selected = settings.userChannels == null
+			? null : settings.userChannels.get("2G");
+		if (selected == null && settings.autoChannels != null) {
+			selected = settings.autoChannels.get("2G");
+		}
+		JsonElement configured = target.get("channel");
+		if (
+			selected == null && configured != null &&
+				configured.isJsonPrimitive() &&
+				configured.getAsJsonPrimitive().isNumber()
+		) {
+			selected = configured.getAsInt();
+		}
+		Set<Integer> primaryChannels = new HashSet<>();
+		if (selected != null) {
+			primaryChannels.add(selected);
+		} else if (
+			configured != null && "auto".equals(configured.getAsString())
+		) {
+			if (target.has("valid-channels")) {
+				for (
+					JsonElement channel : target
+						.getAsJsonArray("valid-channels")
+				) {
+					primaryChannels.add(channel.getAsInt());
+				}
+			} else {
+				primaryChannels.addAll(channels);
+			}
+		} else {
+			throw new IllegalArgumentException(
+				"Cannot determine the configured primary channel"
+			);
+		}
+		if (primaryChannels.isEmpty()) {
+			throw new IllegalArgumentException("No supported primary channels");
+		}
+		for (int channel : primaryChannels) {
+			if (
+				!channels.contains(channel) || (width == 40 && (channel == 14 ||
+					!((channel + 4 <= 13 && channels.contains(channel + 4)) ||
+						(channel - 4 >= 1 && channels.contains(channel - 4)))))
+			) {
+				throw new IllegalArgumentException(
+					"Bandwidth is incompatible with the regulatory channel list"
+				);
+			}
+		}
 	}
 
 	/**

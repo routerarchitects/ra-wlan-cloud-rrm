@@ -1,0 +1,37 @@
+{
+  "status": {
+    "scan": [
+      {
+        "ssid": "ExampleSSID",
+        "bssid": "AA:BB:CC:DD:EE:FF",
+        "channel": 6,
+        "frequency": 2437,
+        "signal": -55,
+        "capability": 17,
+        "last_seen": 25,
+        "ies": [
+          {
+            "name": "RSN",
+            "type": 48,
+            "content": {
+              "RSN Version": 1,
+              "Group Cipher Suite OUI": "00:0f:ac",
+              "Group Cipher Suite type": "AES (CCM)",
+              "Pairwise Cipher Suite List": [
+                {"Group Cipher Suite OUI": "00:0f:ac", "Group Cipher Suite type": "AES (CCM)"}
+              ],
+              "Auth Key Management (AKM) List": [
+                {"Auth Key Management (AKM) OUI": "00:0f:ac", "Auth Key Management (AKM) type": "PSK"},
+                {"Auth Key Management (AKM) OUI": "00:0f:ac", "Auth Key Management (AKM) type": "PSK (SHA256)"}
+              ],
+              "RSN Capabilities": {
+                "Management Frame Protection Capable": 1,
+                "Management Frame Protection Required": 0
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

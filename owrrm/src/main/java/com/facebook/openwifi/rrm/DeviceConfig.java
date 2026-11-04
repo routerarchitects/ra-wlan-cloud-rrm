@@ -63,6 +63,9 @@ public class DeviceConfig {
 	 */
 	public Map<String, Integer> userChannels;
 
+	/** Explicit channel widths in MHz (map from band to width). */
+	public Map<String, Integer> userChannelWidths;
+
 	/**
 	 * The list of allowed tx powers, or null to allow all
 	 * (map from band to tx power)
@@ -89,6 +92,7 @@ public class DeviceConfig {
 		config.allowedChannelWidths = null;
 		config.autoChannels = null;
 		config.userChannels = null;
+		config.userChannelWidths = null;
 		config.allowedTxPowers = null;
 		config.autoTxPowers = null;
 		config.userTxPowers = null;

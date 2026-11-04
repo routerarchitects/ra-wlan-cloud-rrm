@@ -60,6 +60,53 @@ public class UCentralUtils {
 	// This class should not be instantiated.
 	private UCentralUtils() {}
 
+	/** Validate a downstream command acknowledgment rather than trusting default errorCode=0. */
+	public static boolean isCommandAccepted(
+		CommandInfo info,
+		String serialNumber,
+		String command
+	) {
+		if (
+			info == null || info.errorCode != 0 || info.UUID == null ||
+				info.UUID.isEmpty() ||
+				info.status == null || info.status.isEmpty() ||
+				!serialNumber.equals(info.serialNumber) || !command.equals(info.command)
+		) {
+			return false;
+		}
+		if (
+			!Arrays.asList(
+				"pending",
+				"queued",
+				"accepted",
+				"running",
+				"executing",
+				"executed",
+				"completed",
+				"done",
+				"success"
+			)
+				.contains(
+					info.status.toLowerCase(java.util.Locale.ROOT)
+				)
+		) {
+			return false;
+		}
+		try {
+			if (info.results != null && info.results.has("status")) {
+				JsonObject status = info.results.getAsJsonObject("status");
+				if (
+					status.has("error") && status.get("error").getAsInt() != 0
+				) {
+					return false;
+				}
+			}
+		} catch (RuntimeException e) {
+			return false;
+		}
+		return info.submitted > 0 || info.executed > 0 || info.completed > 0;
+	}
+
 	/**
 	 * Builds map from band to ordered (increasing) list of available channels.
 	 */
@@ -111,9 +158,13 @@ public class UCentralUtils {
 				.getAsJsonObject("status")
 				.getAsJsonArray("scan");
 			for (JsonElement e : scanInfo) {
+				if (!e.isJsonObject()) {
+					return null; // Do not publish a partial scan batch.
+				}
 				WifiScanEntry entry = gson.fromJson(e, WifiScanEntry.class);
 				entry.unixTimeMs = timestampMs;
 				extractIEs(e, entry);
+				entry.encryption = WifiSecurity.detect(e.getAsJsonObject());
 				entries.add(entry);
 			}
 		} catch (Exception e) {
@@ -134,13 +185,16 @@ public class UCentralUtils {
 	) {
 		JsonElement iesJsonElement =
 			entryJsonElement.getAsJsonObject().get("ies");
-		if (iesJsonElement == null) {
+		if (iesJsonElement == null || !iesJsonElement.isJsonArray()) {
 			logger.debug("Wifiscan entry does not contain 'ies' field.");
 			return;
 		}
 		JsonArray iesJsonArray = iesJsonElement.getAsJsonArray();
 		InformationElements ieContainer = new InformationElements();
 		for (JsonElement ieJsonElement : iesJsonArray) {
+			if (!ieJsonElement.isJsonObject()) {
+				continue;
+			}
 			JsonElement typeElement =
 				ieJsonElement.getAsJsonObject().get("type");
 			if (typeElement == null) { // shouldn't happen

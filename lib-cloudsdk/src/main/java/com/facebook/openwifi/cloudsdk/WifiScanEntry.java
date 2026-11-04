@@ -24,6 +24,8 @@ public class WifiScanEntry extends WifiScanEntryResult {
 	public long unixTimeMs;
 	/** Stores Information Elements (IEs) from the wifiscan entry. */
 	public InformationElements ieContainer;
+	/** Derived Wi-Fi security mode; never trusted from the input payload. */
+	public String encryption = "UNKNOWN";
 
 	/** Default Constructor. */
 	public WifiScanEntry() {}
@@ -33,13 +35,15 @@ public class WifiScanEntry extends WifiScanEntryResult {
 		super(o);
 		this.unixTimeMs = o.unixTimeMs;
 		this.ieContainer = o.ieContainer;
+		this.encryption = o.encryption;
 	}
 
 	@Override
 	public int hashCode() {
 		final int prime = 31;
 		int result = super.hashCode();
-		result = prime * result + Objects.hash(ieContainer, unixTimeMs);
+		result =
+			prime * result + Objects.hash(ieContainer, unixTimeMs, encryption);
 		return result;
 	}
 
@@ -55,7 +59,8 @@ public class WifiScanEntry extends WifiScanEntryResult {
 			return false;
 		}
 		WifiScanEntry other = (WifiScanEntry) obj;
-		return Objects.equals(ieContainer, other.ieContainer) &&
+		return Objects.equals(encryption, other.encryption) &&
+			Objects.equals(ieContainer, other.ieContainer) &&
 			unixTimeMs == other.unixTimeMs;
 	}
 
