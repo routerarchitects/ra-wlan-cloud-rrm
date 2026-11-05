@@ -127,7 +127,7 @@ public class Modeler implements Runnable {
 		}
 	}
 
-	/** Return an isolated snapshot of the most recently received complete scan. */
+	/** Return an isolated complete scan with the greatest Kafka event timestamp. */
 	public WifiScanBatch getLatestWifiScan(String serialNumber) {
 		WifiScanBatch batch = latestScanBatches.get(serialNumber);
 		if (batch == null) {
@@ -407,9 +407,11 @@ public class Modeler implements Runnable {
 				for (WifiScanEntry entry : scanEntries) {
 					snapshot.add(new WifiScanEntry(entry));
 				}
-				latestScanBatches.put(
-					record.serialNumber,
-					new WifiScanBatch(record.timestampMs, snapshot)
+				// Compare and publish atomically per device. Delayed events and
+				// equal-timestamp duplicates must not replace the latest batch.
+				latestScanBatches.compute(record.serialNumber, (serial, current) ->
+					current == null || record.timestampMs > current.timestampMs
+						? new WifiScanBatch(record.timestampMs, snapshot) : current
 				);
 				wifiScanUpdates.add(record.serialNumber);
 			}

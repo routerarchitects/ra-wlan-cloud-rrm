@@ -48,10 +48,11 @@ public final class WifiSecurity {
 					}
 					rsn = mode;
 				} else if (type == 221) {
-					JsonObject content = ie.getAsJsonObject("content");
-					if (content == null) {
-						return "UNKNOWN";
+					JsonElement decoded = ie.get("content");
+					if (decoded == null || !decoded.isJsonObject()) {
+						continue; // An undecoded vendor IE does not identify WPA.
 					}
+					JsonObject content = decoded.getAsJsonObject();
 					// WMM, WPS and other vendor IEs do not imply WPA.
 					if (
 						"Wi-Fi : WPA / WME".equals(string(content, "vendor")) &&

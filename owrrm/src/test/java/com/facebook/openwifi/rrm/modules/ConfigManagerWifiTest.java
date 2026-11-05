@@ -20,6 +20,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import com.facebook.openwifi.cloudsdk.UCentralApConfiguration;
+import com.facebook.openwifi.cloudsdk.models.gw.CommandInfo;
 import com.facebook.openwifi.rrm.DeviceConfig;
 import com.facebook.openwifi.rrm.DeviceDataManager;
 import com.facebook.openwifi.rrm.DeviceTopology;
@@ -161,6 +162,37 @@ class ConfigManagerWifiTest {
 	}
 
 	@Test
+	void ordinaryConfigDeliveryAcceptsResponsesWithoutCommandMetadata() {
+		DeviceConfig ap = new DeviceConfig();
+		ap.userChannels = Collections.singletonMap("2G", 11);
+		data.setDeviceApConfig(TestWifiClient.SERIAL, ap);
+		client.configResult = new CommandInfo();
+		assertOrdinaryDeliveryIsDebounced();
+	}
+
+	@Test
+	void ordinaryConfigDeliveryDoesNotRequireRecognizedStatus() {
+		DeviceConfig ap = new DeviceConfig();
+		ap.userChannels = Collections.singletonMap("2G", 11);
+		data.setDeviceApConfig(TestWifiClient.SERIAL, ap);
+		client.configResult.status = "gateway-specific-success";
+		assertOrdinaryDeliveryIsDebounced();
+	}
+
+	private void assertOrdinaryDeliveryIsDebounced() {
+		config.moduleConfig.configManagerParams.configDebounceIntervalSec = 3600;
+		manager.queueAllZonesAndWakeUp();
+		manager.runImpl();
+		assertEquals(1, client.configurations.size());
+		assertEquals(11, new UCentralApConfiguration(client.configurations.get(0))
+			.getRadioConfig(0).get("channel").getAsInt());
+		// Requeue to ensure the successful response updated lastConfigTimeNs.
+		manager.queueAllZonesAndWakeUp();
+		manager.runImpl();
+		assertEquals(1, client.configurations.size());
+	}
+
+	@Test
 	void retriesRejectedDeliveryAndDebouncedUpdates() {
 		manager.set2gBandwidth(client.devices.get(0), 40);
 		client.configResult = null;
@@ -168,15 +200,19 @@ class ConfigManagerWifiTest {
 		manager.runImpl();
 		assertEquals(2, client.configurations.size());
 		client.configResult = TestWifiClient.accepted("configure");
+		client.configResult.errorCode = 1;
+		manager.runImpl();
+		assertEquals(3, client.configurations.size());
+		client.configResult.errorCode = 0;
 		manager.runImpl();
 		config.moduleConfig.configManagerParams.configDebounceIntervalSec =
 			3600;
 		manager.set2gBandwidth(client.devices.get(0), 40);
 		manager.runImpl();
-		assertEquals(3, client.configurations.size());
+		assertEquals(4, client.configurations.size());
 		config.moduleConfig.configManagerParams.configDebounceIntervalSec = -1;
 		manager.runImpl();
-		assertEquals(4, client.configurations.size());
+		assertEquals(5, client.configurations.size());
 	}
 
 	@Test

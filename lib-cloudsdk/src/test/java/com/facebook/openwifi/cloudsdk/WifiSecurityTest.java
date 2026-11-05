@@ -82,6 +82,41 @@ class WifiSecurityTest {
 	}
 
 	@Test
+	void unrelatedVendorIesDoNotInvalidateValidRsn() {
+		for (String vendorIe : new String[] {
+			"{\"type\":221,\"data\":\"...\"}",
+			"{\"type\":221,\"content\":null}",
+			"{\"type\":221,\"content\":\"undecoded\"}",
+			"{\"type\":221,\"content\":[]}",
+			"{\"type\":221,\"content\":{}}",
+			"{\"type\":221,\"content\":{\"vendor\":[],\"type\":{}}}",
+			"{\"type\":221,\"content\":{\"vendor\":\"Wi-Fi : WPA / WME\",\"type\":\"WMM/WME\"}}"
+		}) {
+			JsonArray ies = entry.getAsJsonArray("ies");
+			ies.add(new Gson().fromJson(vendorIe, JsonObject.class));
+			assertEquals("WPA2", WifiSecurity.detect(entry), vendorIe);
+			assertEquals("WPA2",
+				UCentralUtils.parseWifiScanEntries(payload, 1000).get(0).encryption);
+			// Classification must also be independent of IE ordering.
+			JsonArray reversed = new JsonArray();
+			reversed.add(ies.get(1));
+			reversed.add(ies.get(0));
+			entry.add("ies", reversed);
+			assertEquals("WPA2", WifiSecurity.detect(entry), vendorIe);
+			entry.add("ies", ies);
+			ies.remove(1);
+		}
+	}
+
+	@Test
+	void positivelyIdentifiedMalformedWpaStillInvalidatesValidRsn() {
+		entry.getAsJsonArray("ies").add(new Gson().fromJson(
+			"{\"type\":221,\"content\":{\"vendor\":\"Wi-Fi : WPA / WME\",\"type\":\"WPA Information Element\"}}",
+			JsonObject.class));
+		assertEquals("UNKNOWN", WifiSecurity.detect(entry));
+	}
+
+	@Test
 	void requiresPmfAndStrongCiphersForWpa3AndTransition() {
 		akms("SAE");
 		assertEquals("UNKNOWN", WifiSecurity.detect(entry));

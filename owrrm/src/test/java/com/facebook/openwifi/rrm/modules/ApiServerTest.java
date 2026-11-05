@@ -869,6 +869,18 @@ public class ApiServerTest {
 		assertEquals(6, network.getInt("channel"));
 		assertEquals(-55, network.getInt("signal"));
 		assertEquals("OPEN", network.getString("encryption"));
+		// An older scan arriving later must not replace the API snapshot.
+		modeler.processData(
+			modeler.new InputData(
+				Modeler.InputDataType.WIFISCAN,
+				Arrays.asList(new KafkaRecord(
+					TestWifiClient.SERIAL,
+					gson.fromJson("{\"status\":{\"scan\":[]}}", JsonObject.class),
+					timestamp - 500
+				))
+			)
+		);
+		assertEquals(result.toMap(), new JSONObject(wifiResults(TestWifiClient.SERIAL).getBody()).toMap());
 		assertEquals(404, wifiResults("other-device").getStatus());
 		assertEquals(404, wifiResults("unknown").getStatus());
 		modeler.processData(

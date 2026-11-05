@@ -74,7 +74,7 @@ class ModelerWifiTest {
 	}
 
 	@Test
-	void latestReceivedBatchIsCompleteBoundedAndTimestampedEvenWhenEmpty() {
+	void latestBatchIsCompleteBoundedAndTimestampedEvenWhenEmpty() {
 		ingest(
 			TestWifiClient.SERIAL,
 			1000,
@@ -89,9 +89,9 @@ class ModelerWifiTest {
 			"new",
 			modeler.getLatestWifiScan(TestWifiClient.SERIAL).entries.get(0).ssid
 		);
-		ingest(TestWifiClient.SERIAL, 1500, "[]");
+		ingest(TestWifiClient.SERIAL, 2500, "[]");
 		assertEquals(
-			1500,
+			2500,
 			modeler.getLatestWifiScan(TestWifiClient.SERIAL).timestampMs
 		);
 		assertTrue(
@@ -103,13 +103,31 @@ class ModelerWifiTest {
 		);
 		ingest(TestWifiClient.SERIAL, 3000, "[null]");
 		assertEquals(
-			1500,
+			2500,
 			modeler.getLatestWifiScan(TestWifiClient.SERIAL).timestampMs
 		);
 		assertNull(modeler.getLatestWifiScan("other-device"));
 		data.setTopology(new DeviceTopology());
 		modeler.revalidate();
 		assertNull(modeler.getLatestWifiScan(TestWifiClient.SERIAL));
+	}
+
+	@Test
+	void delayedEventsAndTimestampTiesCannotReplaceLatestBatch() {
+		ingest(TestWifiClient.SERIAL, 2000, "[{\"ssid\":\"new\"}]");
+		ingest(TestWifiClient.SERIAL, 1500, "[{\"ssid\":\"old\"}]");
+		assertEquals(2000, modeler.getLatestWifiScan(TestWifiClient.SERIAL).timestampMs);
+		assertEquals("new", modeler.getLatestWifiScan(TestWifiClient.SERIAL).entries.get(0).ssid);
+		ingest(TestWifiClient.SERIAL, 1500, "[]");
+		ingest(TestWifiClient.SERIAL, 2000, "[]");
+		assertEquals(2000, modeler.getLatestWifiScan(TestWifiClient.SERIAL).timestampMs);
+		assertEquals("new", modeler.getLatestWifiScan(TestWifiClient.SERIAL).entries.get(0).ssid);
+		ingest("other-device", 1500, "[]");
+		assertEquals(1500, modeler.getLatestWifiScan("other-device").timestampMs);
+		ingest(TestWifiClient.SERIAL, 2500, "[]");
+		ingest(TestWifiClient.SERIAL, 2250, "[{\"ssid\":\"delayed\"}]");
+		assertEquals(2500, modeler.getLatestWifiScan(TestWifiClient.SERIAL).timestampMs);
+		assertTrue(modeler.getLatestWifiScan(TestWifiClient.SERIAL).entries.isEmpty());
 	}
 
 	@Test
@@ -123,10 +141,19 @@ class ModelerWifiTest {
 				);
 			}
 		});
+		CompletableFuture<Void> delayedWriter = CompletableFuture.runAsync(() -> {
+			for (int i = 1000; i >= 1; i--) {
+				ingest(TestWifiClient.SERIAL, i,
+					"[{\"ssid\":\"a\"},{\"ssid\":\"b\"}]");
+			}
+		});
+		long lastTimestamp = 0;
 		for (int i = 0; i < 2000; i++) {
 			Modeler.WifiScanBatch batch =
 				modeler.getLatestWifiScan(TestWifiClient.SERIAL);
 			if (batch != null) {
+				assertTrue(batch.timestampMs >= lastTimestamp);
+				lastTimestamp = batch.timestampMs;
 				assertEquals(2, batch.entries.size());
 				assertEquals(
 					batch.timestampMs,
@@ -140,6 +167,7 @@ class ModelerWifiTest {
 			}
 		}
 		writer.join();
+		delayedWriter.join();
 		assertEquals(
 			1000,
 			modeler.getLatestWifiScan(TestWifiClient.SERIAL).timestampMs

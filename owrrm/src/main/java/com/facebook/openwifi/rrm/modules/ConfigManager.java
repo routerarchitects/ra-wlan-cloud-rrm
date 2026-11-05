@@ -310,13 +310,10 @@ public class ConfigManager implements Runnable {
 				try {
 					CommandInfo result =
 						client.configure(serialNumber, entry.getValue());
-					if (
-						UCentralUtils.isCommandAccepted(
-							result,
-							serialNumber,
-							"configure"
-						)
-					) {
+					// Keep configuration delivery independent of the scan API's
+					// stricter acknowledgment contract. Gateway versions may omit
+					// command identity, status, UUID or timing metadata.
+					if (result != null && result.errorCode == 0) {
 						data.lastConfigTimeNs = System.nanoTime();
 					} else {
 						logger.error(

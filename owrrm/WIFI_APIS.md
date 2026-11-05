@@ -102,6 +102,12 @@ Previously queued changes still undergo normal evaluation. Neither status
 confirms the device's operating width. A later delivery failure is logged and
 retried; it cannot change a previously returned HTTP acknowledgment.
 
+Configuration delivery accepts a non-null SDK response with `errorCode == 0`.
+It does not require the scan endpoint's command identity, UUID, status or timing
+metadata. The deployed gateway response formats and supported version matrix
+have not been verified here; capture real `configure` and `wifiscan` responses
+from each supported version before extending the stricter contract to delivery.
+
 ## Trigger a scan
 
 `POST /api/v1/device/{serialNumber}/wifiScan` calls the managed
@@ -150,8 +156,10 @@ exactly these fields:
 ```
 
 The endpoint reads only the specified device. It returns all entries in the
-most recently **received complete event**, without merging scan rounds. Signal
-is in dBm. Timestamp is the Kafka event timestamp in UTC ISO 8601, never
+complete event with the **greatest Kafka event timestamp**, without merging scan
+rounds. Older events and equal-timestamp duplicates cannot replace that batch;
+the first complete event wins a timestamp tie. Signal is in dBm. Timestamp is
+the Kafka event timestamp in UTC ISO 8601, never
 `last_seen` and never the HTTP request time. An empty completed scan is valid:
 
 ```json
@@ -161,9 +169,9 @@ is in dBm. Timestamp is the Kafka event timestamp in UTC ISO 8601, never
 Malformed entry batches do not replace the previous good batch. Malformed
 security information produces `UNKNOWN` without discarding otherwise valid scan
 entries. Snapshots are published atomically and copied for concurrent API reads.
-The optimizer's existing bounded scan history and parsed information elements
-are preserved. Scan state is in memory and is cleared on restart, topology
-removal, or RRM disablement; no database is added.
+The optimizer's existing bounded scan history remains in arrival order, and its
+parsed information elements are preserved. Scan state is in memory and is
+cleared on restart, topology removal, or RRM disablement; no database is added.
 
 Unknown devices return **404** `Device not found`. Known devices without scan
 history return **404** `No scan history for device`. Stale scans are returned with

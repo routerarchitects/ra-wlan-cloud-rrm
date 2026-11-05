@@ -144,6 +144,8 @@ paths:
       tags:
       - SDK
       summary: Read the latest complete scan batch
+      description: Returns the complete batch with the greatest Kafka event timestamp.
+        Older events and equal-timestamp duplicates do not replace it.
       operationId: getWifiScanResults
       parameters:
       - name: X-INTERNAL-NAME

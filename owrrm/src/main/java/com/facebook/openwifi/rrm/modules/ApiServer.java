@@ -1339,6 +1339,8 @@ public class ApiServer implements Runnable {
 		@Operation(
 			operationId = "getWifiScanResults",
 			summary = "Read the latest complete scan batch",
+			description = "Returns the complete batch with the greatest Kafka event timestamp. " +
+				"Older events and equal-timestamp duplicates do not replace it.",
 			tags = { "SDK" },
 			security = @SecurityRequirement(name = "internalServiceKey"),
 			parameters = @Parameter(
