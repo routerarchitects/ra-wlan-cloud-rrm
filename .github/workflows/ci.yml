@@ -7,6 +7,8 @@ on:
     branches:
       - main
       - 'release/*'
+      # Diagnostic fallback while investigating missing fork PR events.
+      - mcp_rrm_wifi_scan
     tags:
       - 'v*'
   pull_request:
@@ -30,6 +32,11 @@ jobs:
   maven:
     name: Unit and Mock Integration Tests
     runs-on: ubuntu-latest
+    concurrency:
+      # PR and diagnostic push events share one test run per source branch.
+      # Other branches/releases keep independent runs.
+      group: maven-${{ github.head_ref || (github.ref_name == 'mcp_rrm_wifi_scan' && github.ref_name) || github.run_id }}
+      cancel-in-progress: true
     steps:
     - uses: actions/checkout@v4
     - name: Set up JDK 11
