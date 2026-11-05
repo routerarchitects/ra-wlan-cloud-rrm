@@ -102,11 +102,97 @@ Previously queued changes still undergo normal evaluation. Neither status
 confirms the device's operating width. A later delivery failure is logged and
 retried; it cannot change a previously returned HTTP acknowledgment.
 
+An invalid persisted bandwidth override is skipped independently of channel and
+transmit-power changes. The override remains saved, and the existing pipeline
+can still deliver valid changes to those other fields. Unsupported modes,
+policy or regulatory conflicts, missing 2.4 GHz radios, and malformed persisted
+widths do not requeue themselves. A later configuration event or a periodic
+evaluation (`configOnEventOnly=false`) revalidates the selection against current
+capabilities; correcting the width through this API uses the normal delivery
+pipeline.
+
+Missing capability responses and capability retrieval exceptions retain the
+zone for retry. Capability retrieval and failed configuration delivery retry
+no sooner than the ConfigManager loop interval (`updateIntervalMs`, normally
+120000 ms). They do not interrupt the loop's sleep. Capability retry delays
+apply only to the same requested width, so a changed selection can be evaluated
+immediately. Existing successful-delivery debounce still applies.
+
+The retry policy intentionally uses a fixed delay for this initial
+implementation. There is no exponential increase, jitter, retry-count limit or
+automatic expiry of persisted intent. At the default interval, a continuing
+failure permits approximately 30 automatic retry attempts per hour per device
+for each pending failure path, before processing time or debounce delays. Fleet
+traffic scales with the number of affected devices. Increasing
+`configManagerParams.updateIntervalMs` (environment variable
+`CONFIGMANAGERPARAMS_UPDATEINTERVALMS`) lengthens this delay and the normal
+configuration loop interval. Retry deadlines are in memory and reset on restart.
+Capped exponential backoff remains a follow-up for deployments where persistent
+outages produce excessive traffic; the current delay does not grow during an
+outage.
+
 Configuration delivery accepts a non-null SDK response with `errorCode == 0`.
 It does not require the scan endpoint's command identity, UUID, status or timing
 metadata. The deployed gateway response formats and supported version matrix
 have not been verified here; capture real `configure` and `wifiscan` responses
 from each supported version before extending the stricter contract to delivery.
+
+Automated HTTP integration coverage uses a local mock gateway and explicitly
+synthetic response fixtures. It does not establish compatibility with deployed
+OWGW versions. See [PR #2 verification](PR2_VERIFICATION.md) for commands, results,
+and outstanding integration evidence.
+
+### Identify failures and verify the radio width
+
+There is no per-request operation ID or delivery-status API for an accepted
+bandwidth request. The initial HTTP 200/202 cannot report a later failure.
+Configuration changes for a zone can be coalesced, so correlate observations
+using the device serial number and request time; logs do not establish a
+one-to-one request history.
+
+1. Read `GET /api/v1/getDeviceConfig?serial={serialNumber}` through the existing
+   authenticated RRM configuration interface and inspect
+   `userChannelWidths["2G"]`. This is effective persisted intent. Use
+   `GET /api/v1/getDeviceLayeredConfig` when the source configuration layer needs
+   inspection. Neither response confirms delivery or device application.
+2. Search RRM's logs for the serial number around and after the request time.
+   The shipped logging configuration writes to stdout and the rolling
+   `./openwifi-rrm.log` file relative to the service working directory. For a
+   deployment using this repository's Helm chart, set `RRM_NAMESPACE`, `RRM_POD`
+   and `SERIAL_NUMBER` to the relevant values, then run:
+
+   ```bash
+   kubectl --namespace "$RRM_NAMESPACE" logs "$RRM_POD" \
+     --container owrrm --since=1h | rg -F -- "$SERIAL_NUMBER"
+   ```
+
+   | Message after `Device {serialNumber}:` | Meaning and next step |
+   | --- | --- |
+   | `invalid persisted bandwidth: ...` | The saved value is null or outside 20/40 MHz. Correct it through the supported configuration API. No automatic validation retry is queued. |
+   | `invalid bandwidth configuration: ...` | Current radio, capability, policy or regulatory validation failed. Inspect the appended reason and correct the request or constraint. The override remains saved; revalidation needs a later event or periodic evaluation. |
+   | `cannot retrieve bandwidth capabilities: ...` | Capability retrieval failed or returned no response. Check OWGW availability; work remains queued with the fixed retry delay. |
+   | `configuration command failed; retaining update` | Configuration delivery returned null or a nonzero error code. Check adjacent SDK and OWGW logs; delivery remains queued. |
+   | `configuration delivery failed` | Delivery raised an exception. Inspect the accompanying exception and OWGW connectivity; delivery remains queued. |
+
+3. Read the device's current OWGW configuration through the deployment's
+   authorized gateway interface. The existing SDK's `UCentralClient.getDevices()`
+   reads `GET /api/v1/devices?deviceWithStatus=true`; select the matching
+   `serialNumber` and inspect `configuration.radios` for `band: "2G"` and numeric
+   `channel-width`. This is OWGW's configured value and can lag delivery; it is
+   separate from the AP's operating width.
+4. Verify the operating width using fresh AP telemetry or the deployment's
+   device diagnostics. The SDK's `getLatestStats(serialNumber, 1)` retrieves the
+   newest statistics record; the current state model exposes
+   `radios[].channel_width`. Match the PHY to the 2.4 GHz radio and check that the
+   record timestamp is later than the attempted change. Stale telemetry cannot
+   confirm application. AP/driver regulatory and 20/40 coexistence decisions can
+   also cause the operating width to differ from the configured width.
+
+A `sending new configuration...` log line, an error-free interval, or a scan
+result is insufficient to establish that the requested width is operating.
+After correcting an invalid override, use the bandwidth endpoint again and
+repeat the configuration and telemetry checks. A per-operation status API and
+durable request correlation remain follow-ups.
 
 ## Trigger a scan
 
