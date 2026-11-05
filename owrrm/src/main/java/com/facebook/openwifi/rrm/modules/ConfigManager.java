@@ -18,6 +18,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongSupplier;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,10 +53,18 @@ public class ConfigManager implements Runnable {
 	/** The uCentral client. */
 	private final UCentralClient client;
 
+	/** Monotonic clock, injectable for retry/debounce tests. */
+	private final LongSupplier nanoTime;
+
 	/** Runtime per-device data. */
 	private class DeviceData {
 		/** Last config time (in monotonic ns). */
 		public Long lastConfigTimeNs;
+		/** Do not retry failed delivery before the normal loop interval. */
+		public Long configRetryAfterNs;
+		/** Only capability retrieval failures are automatically retried. */
+		public Long bandwidthRetryAfterNs;
+		public Integer bandwidthRetryWidth;
 	}
 
 	/** Map from device serial number to runtime data. */
@@ -109,9 +118,19 @@ public class ConfigManager implements Runnable {
 		DeviceDataManager deviceDataManager,
 		UCentralClient client
 	) {
+		this(params, deviceDataManager, client, System::nanoTime);
+	}
+
+	ConfigManager(
+		ConfigManagerParams params,
+		DeviceDataManager deviceDataManager,
+		UCentralClient client,
+		LongSupplier nanoTime
+	) {
 		this.params = params;
 		this.deviceDataManager = deviceDataManager;
 		this.client = client;
+		this.nanoTime = nanoTime;
 
 		// Apply RRM parameters
 		addConfigListener(
@@ -184,7 +203,7 @@ public class ConfigManager implements Runnable {
 		}
 		logger.debug("Received device list of size = {}", devices.size());
 
-		long now = System.nanoTime();
+		long now = nanoTime.getAsLong();
 
 		// Apply any config updates locally
 		Map<String, String> devicesNeedingUpdate = new HashMap<>();
@@ -256,6 +275,13 @@ public class ConfigManager implements Runnable {
 			// Queue config update if past debounce interval
 			if (modified) {
 				if (
+					data.configRetryAfterNs != null &&
+						now - data.configRetryAfterNs < 0
+				) {
+					retainZoneForRetry(device.serialNumber);
+					continue;
+				}
+				if (
 					data.lastConfigTimeNs != null &&
 						now - data.lastConfigTimeNs <
 							CONFIG_DEBOUNCE_INTERVAL_NS
@@ -314,15 +340,15 @@ public class ConfigManager implements Runnable {
 					// stricter acknowledgment contract. Gateway versions may omit
 					// command identity, status, UUID or timing metadata.
 					if (result != null && result.errorCode == 0) {
-						data.lastConfigTimeNs = System.nanoTime();
+						data.lastConfigTimeNs = nanoTime.getAsLong();
+						data.configRetryAfterNs = null;
 					} else {
 						logger.error(
 							"Device {}: configuration command failed; retaining update",
 							serialNumber
 						);
-						queueZoneAndWakeUp(
-							deviceDataManager.getDeviceZone(serialNumber)
-						);
+						data.configRetryAfterNs = nextRetryTimeNs();
+						retainZoneForRetry(serialNumber);
 					}
 				} catch (RuntimeException e) {
 					logger.error(
@@ -330,9 +356,8 @@ public class ConfigManager implements Runnable {
 						serialNumber,
 						e
 					);
-					queueZoneAndWakeUp(
-						deviceDataManager.getDeviceZone(serialNumber)
-					);
+					data.configRetryAfterNs = nextRetryTimeNs();
+					retainZoneForRetry(serialNumber);
 				}
 			}
 		}
@@ -405,31 +430,90 @@ public class ConfigManager implements Runnable {
 				deviceConfig.userChannelWidths
 					.containsKey(UCentralConstants.BAND_2G)
 		) {
-			int width =
-				deviceConfig.userChannelWidths.get(UCentralConstants.BAND_2G);
-			try {
-				DeviceCapabilities capabilities =
-					client.getCapabilities(serialNumber);
-				validate2gBandwidth(config, deviceConfig, capabilities, width);
-				modified |= UCentralUtils.setRadioConfigField(
-					serialNumber,
-					config,
-					"channel-width",
-					Collections.singletonMap(UCentralConstants.BAND_2G, width)
-				);
-			} catch (RuntimeException e) {
-				logger.error(
-					"Device {}: cannot apply bandwidth: {}",
-					serialNumber,
-					e.getMessage()
-				);
-				queueZoneAndWakeUp(
-					deviceDataManager.getDeviceZone(serialNumber)
-				);
-				return false;
-			}
+			modified |= apply2gBandwidth(serialNumber, config, deviceConfig);
 		}
 		return modified;
+	}
+
+	/** Apply bandwidth independently so failure cannot suppress channel or power updates. */
+	private boolean apply2gBandwidth(
+		String serialNumber,
+		UCentralApConfiguration config,
+		DeviceConfig settings
+	) {
+		Integer width =
+			settings.userChannelWidths.get(UCentralConstants.BAND_2G);
+		DeviceData data =
+			deviceDataMap.computeIfAbsent(serialNumber, k -> new DeviceData());
+		if (width == null || (width != 20 && width != 40)) {
+			data.bandwidthRetryAfterNs = null;
+			logger.error(
+				"Device {}: invalid persisted bandwidth: {}",
+				serialNumber,
+				width
+			);
+			return false;
+		}
+		if (
+			data.bandwidthRetryAfterNs != null && width
+				.equals(data.bandwidthRetryWidth) &&
+				nanoTime.getAsLong() - data.bandwidthRetryAfterNs < 0
+		) {
+			retainZoneForRetry(serialNumber);
+			return false;
+		}
+		DeviceCapabilities capabilities;
+		try {
+			capabilities = client.getCapabilities(serialNumber);
+			if (capabilities == null) {
+				throw new IllegalStateException(
+					"Device capabilities are temporarily unavailable"
+				);
+			}
+		} catch (RuntimeException e) {
+			logger.warn(
+				"Device {}: cannot retrieve bandwidth capabilities: {}",
+				serialNumber,
+				e.getMessage()
+			);
+			data.bandwidthRetryWidth = width;
+			data.bandwidthRetryAfterNs = nextRetryTimeNs();
+			retainZoneForRetry(serialNumber);
+			return false;
+		}
+		data.bandwidthRetryAfterNs = null;
+		try {
+			// Validation only reads config. Change the width only after it succeeds.
+			validate2gBandwidth(config, settings, capabilities, width);
+			return UCentralUtils.setRadioConfigField(
+				serialNumber,
+				config,
+				"channel-width",
+				Collections.singletonMap(UCentralConstants.BAND_2G, width)
+			);
+		} catch (RuntimeException e) {
+			// Unsupported/malformed persisted settings do not schedule themselves again.
+			// A later config/capability event or periodic evaluation can revalidate them.
+			logger.error(
+				"Device {}: invalid bandwidth configuration: {}",
+				serialNumber,
+				e.getMessage()
+			);
+			return false;
+		}
+	}
+
+	private long nextRetryTimeNs() {
+		return nanoTime.getAsLong() +
+			Math.max(1L, params.updateIntervalMs) * 1_000_000L;
+	}
+
+	/** Retain work for the existing loop without interrupting its normal sleep. */
+	private void retainZoneForRetry(String serialNumber) {
+		String zone = deviceDataManager.getDeviceZone(serialNumber);
+		if (zone != null) {
+			zonesToUpdate.add(zone);
+		}
 	}
 
 	/** Persist a validated manual selection and enqueue the existing zone delivery pipeline. */

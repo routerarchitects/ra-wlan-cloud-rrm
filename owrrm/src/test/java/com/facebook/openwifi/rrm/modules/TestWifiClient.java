@@ -28,8 +28,13 @@ class TestWifiClient extends UCentralClient {
 	CommandInfo scanResult = accepted("wifiscan");
 	CommandInfo configResult = accepted("configure");
 	RuntimeException scanFailure;
+	RuntimeException capabilitiesFailure;
+	RuntimeException configFailure;
+	int capabilitiesCalls;
 	int scanCalls;
 	boolean scanVerbose;
+	/** Exercise the actual SDK transport against the local mock gateway. */
+	boolean useHttpCommands;
 	final List<String> configurations = new ArrayList<>();
 
 	TestWifiClient() {
@@ -70,6 +75,10 @@ class TestWifiClient extends UCentralClient {
 
 	@Override
 	public DeviceCapabilities getCapabilities(String serial) {
+		capabilitiesCalls++;
+		if (capabilitiesFailure != null) {
+			throw capabilitiesFailure;
+		}
 		return capabilities;
 	}
 
@@ -80,12 +89,21 @@ class TestWifiClient extends UCentralClient {
 		if (scanFailure != null) {
 			throw scanFailure;
 		}
+		if (useHttpCommands) {
+			return super.wifiScan(serial, verbose);
+		}
 		return scanResult;
 	}
 
 	@Override
 	public CommandInfo configure(String serial, String configuration) {
 		configurations.add(configuration);
+		if (configFailure != null) {
+			throw configFailure;
+		}
+		if (useHttpCommands) {
+			return super.configure(serial, configuration);
+		}
 		return configResult;
 	}
 }

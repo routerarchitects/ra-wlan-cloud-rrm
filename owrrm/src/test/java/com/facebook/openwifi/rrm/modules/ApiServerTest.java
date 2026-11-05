@@ -43,6 +43,8 @@ import com.facebook.openwifi.rrm.RRMConfig;
 import com.facebook.openwifi.rrm.VersionProvider;
 import com.facebook.openwifi.rrm.mysql.DatabaseManager;
 import com.facebook.openwifi.rrm.services.MockOWSecService;
+import com.facebook.openwifi.rrm.services.MockOWGWService;
+import com.facebook.openwifi.cloudsdk.UCentralApConfiguration;
 import com.facebook.openwifi.rrm.Utils;
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
@@ -771,6 +773,76 @@ public class ApiServerTest {
 	}
 
 	@Test
+	void wifiBandwidthEndpointPersistsAndDeliversUsingRealSdkToMockGateway()
+		throws Exception {
+		wifiTopology();
+		try (MockOWGWService gateway = new MockOWGWService()) {
+			gateway.connect(wifiClient);
+			wifiClient.useHttpCommands = true;
+			gateway.responseBody =
+				"{\"errorCode\":0,\"status\":\"gateway-specific-success\"}";
+			assertEquals(
+				202,
+				wifiPut(TestWifiClient.SERIAL)
+					.body("{\"band\":\"2g\",\"bandwidth\":\"HT40\"}")
+					.asString()
+					.getStatus()
+			);
+			assertEquals(
+				40,
+				deviceDataManager.getDeviceConfig(TestWifiClient.SERIAL).userChannelWidths.get("2G")
+			);
+			configManager.runImpl();
+			assertEquals(1, gateway.calls.get());
+			assertEquals(
+				"/api/v1/device/" + TestWifiClient.SERIAL + "/configure",
+				gateway.requestPath
+			);
+			UCentralApConfiguration delivered = new UCentralApConfiguration(
+				gateway.requestBody.get("configuration").getAsString()
+			);
+			assertEquals(
+				40,
+				delivered.getRadioConfig(0).get("channel-width").getAsInt()
+			);
+			assertEquals(
+				6,
+				delivered.getRadioConfig(0).get("channel").getAsInt()
+			);
+			assertEquals(
+				17,
+				delivered.getRadioConfig(0).get("tx-power").getAsInt()
+			);
+			assertEquals(
+				TestWifiClient.SERIAL,
+				gateway.requestBody.get("serialNumber").getAsString()
+			);
+			assertEquals("synthetic-gateway-key", gateway.apiKey);
+		}
+	}
+
+	@Test
+	void wifiScanEndpointUsesRealSdkAgainstMockGateway() throws Exception {
+		wifiTopology();
+		try (MockOWGWService gateway = new MockOWGWService()) {
+			gateway.connect(wifiClient);
+			wifiClient.useHttpCommands = true;
+			gateway.responseBody =
+				gson.toJson(TestWifiClient.accepted("wifiscan"));
+			assertEquals(202, wifiPost().asString().getStatus());
+			assertEquals(1, gateway.calls.get());
+			assertFalse(gateway.requestBody.get("verbose").getAsBoolean());
+			gateway.responseBody = "{\"errorCode\":1}";
+			assertEquals(502, wifiPost().asString().getStatus());
+			gateway.responseBody = "null";
+			assertEquals(502, wifiPost().asString().getStatus());
+			gateway.responseBody = "{\"errorCode\":0,\"status\":\"timedout\"}";
+			assertEquals(504, wifiPost().asString().getStatus());
+			assertEquals(4, gateway.calls.get());
+		}
+	}
+
+	@Test
 	void wifiScanCommandAcceptanceAndFailures() {
 		wifiTopology();
 		String key = Utils.generateServiceKey(rrmConfig.serviceConfig);
@@ -873,14 +945,22 @@ public class ApiServerTest {
 		modeler.processData(
 			modeler.new InputData(
 				Modeler.InputDataType.WIFISCAN,
-				Arrays.asList(new KafkaRecord(
-					TestWifiClient.SERIAL,
-					gson.fromJson("{\"status\":{\"scan\":[]}}", JsonObject.class),
-					timestamp - 500
-				))
+				Arrays.asList(
+					new KafkaRecord(
+						TestWifiClient.SERIAL,
+						gson.fromJson(
+							"{\"status\":{\"scan\":[]}}",
+							JsonObject.class
+						),
+						timestamp - 500
+					)
+				)
 			)
 		);
-		assertEquals(result.toMap(), new JSONObject(wifiResults(TestWifiClient.SERIAL).getBody()).toMap());
+		assertEquals(
+			result.toMap(),
+			new JSONObject(wifiResults(TestWifiClient.SERIAL).getBody()).toMap()
+		);
 		assertEquals(404, wifiResults("other-device").getStatus());
 		assertEquals(404, wifiResults("unknown").getStatus());
 		modeler.processData(
