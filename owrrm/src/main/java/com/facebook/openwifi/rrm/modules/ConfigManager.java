@@ -9,6 +9,8 @@
 package com.facebook.openwifi.rrm.modules;
 
 import java.util.HashMap;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -16,6 +18,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongSupplier;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,7 +26,13 @@ import org.slf4j.LoggerFactory;
 import com.facebook.openwifi.cloudsdk.UCentralApConfiguration;
 import com.facebook.openwifi.cloudsdk.UCentralClient;
 import com.facebook.openwifi.cloudsdk.UCentralUtils;
+import com.facebook.openwifi.cloudsdk.UCentralConstants;
+import com.facebook.openwifi.cloudsdk.models.ap.Capabilities;
+import com.facebook.openwifi.cloudsdk.models.gw.DeviceCapabilities;
+import com.facebook.openwifi.cloudsdk.models.gw.CommandInfo;
 import com.facebook.openwifi.cloudsdk.models.gw.DeviceWithStatus;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonElement;
 import com.facebook.openwifi.rrm.DeviceConfig;
 import com.facebook.openwifi.rrm.DeviceDataManager;
 import com.facebook.openwifi.rrm.RRMConfig.ModuleConfig.ConfigManagerParams;
@@ -44,10 +53,18 @@ public class ConfigManager implements Runnable {
 	/** The uCentral client. */
 	private final UCentralClient client;
 
+	/** Monotonic clock, injectable for retry/debounce tests. */
+	private final LongSupplier nanoTime;
+
 	/** Runtime per-device data. */
 	private class DeviceData {
 		/** Last config time (in monotonic ns). */
 		public Long lastConfigTimeNs;
+		/** Do not retry failed delivery before the normal loop interval. */
+		public Long configRetryAfterNs;
+		/** Only capability retrieval failures are automatically retried. */
+		public Long bandwidthRetryAfterNs;
+		public Integer bandwidthRetryWidth;
 	}
 
 	/** Map from device serial number to runtime data. */
@@ -101,9 +118,19 @@ public class ConfigManager implements Runnable {
 		DeviceDataManager deviceDataManager,
 		UCentralClient client
 	) {
+		this(params, deviceDataManager, client, System::nanoTime);
+	}
+
+	ConfigManager(
+		ConfigManagerParams params,
+		DeviceDataManager deviceDataManager,
+		UCentralClient client,
+		LongSupplier nanoTime
+	) {
 		this.params = params;
 		this.deviceDataManager = deviceDataManager;
 		this.client = client;
+		this.nanoTime = nanoTime;
 
 		// Apply RRM parameters
 		addConfigListener(
@@ -157,7 +184,7 @@ public class ConfigManager implements Runnable {
 	}
 
 	/** Run single iteration of application logic. */
-	private void runImpl() {
+	void runImpl() {
 		while (!client.isInitialized()) {
 			logger.trace("Waiting for ucentral client");
 			try {
@@ -176,7 +203,7 @@ public class ConfigManager implements Runnable {
 		}
 		logger.debug("Received device list of size = {}", devices.size());
 
-		long now = System.nanoTime();
+		long now = nanoTime.getAsLong();
 
 		// Apply any config updates locally
 		Map<String, String> devicesNeedingUpdate = new HashMap<>();
@@ -194,6 +221,11 @@ public class ConfigManager implements Runnable {
 			);
 			// Update the device only when it is still connected
 			if (!device.connected) {
+				String zone =
+					deviceDataManager.getDeviceZone(device.serialNumber);
+				if (zone != null && zonesToUpdateCopy.contains(zone)) {
+					zonesToUpdate.add(zone);
+				}
 				logger.info(
 					"Device {} is disconnected, skipping...",
 					device.serialNumber
@@ -243,6 +275,13 @@ public class ConfigManager implements Runnable {
 			// Queue config update if past debounce interval
 			if (modified) {
 				if (
+					data.configRetryAfterNs != null &&
+						now - data.configRetryAfterNs < 0
+				) {
+					retainZoneForRetry(device.serialNumber);
+					continue;
+				}
+				if (
 					data.lastConfigTimeNs != null &&
 						now - data.lastConfigTimeNs <
 							CONFIG_DEBOUNCE_INTERVAL_NS
@@ -252,6 +291,9 @@ public class ConfigManager implements Runnable {
 						device.serialNumber,
 						(now - data.lastConfigTimeNs) / 1_000_000_000L
 					);
+					if (isEvent) {
+						zonesToUpdate.add(deviceZone);
+					}
 					continue;
 				} else {
 					devicesNeedingUpdate
@@ -291,8 +333,32 @@ public class ConfigManager implements Runnable {
 					"Device {}: sending new configuration...",
 					serialNumber
 				);
-				data.lastConfigTimeNs = System.nanoTime();
-				client.configure(serialNumber, entry.getValue());
+				try {
+					CommandInfo result =
+						client.configure(serialNumber, entry.getValue());
+					// Keep configuration delivery independent of the scan API's
+					// stricter acknowledgment contract. Gateway versions may omit
+					// command identity, status, UUID or timing metadata.
+					if (result != null && result.errorCode == 0) {
+						data.lastConfigTimeNs = nanoTime.getAsLong();
+						data.configRetryAfterNs = null;
+					} else {
+						logger.error(
+							"Device {}: configuration command failed; retaining update",
+							serialNumber
+						);
+						data.configRetryAfterNs = nextRetryTimeNs();
+						retainZoneForRetry(serialNumber);
+					}
+				} catch (RuntimeException e) {
+					logger.error(
+						"Device {}: configuration delivery failed",
+						serialNumber,
+						e
+					);
+					data.configRetryAfterNs = nextRetryTimeNs();
+					retainZoneForRetry(serialNumber);
+				}
 			}
 		}
 	}
@@ -313,7 +379,7 @@ public class ConfigManager implements Runnable {
 	 * If any changes are needed, modify the config and return true.
 	 * Otherwise, return false.
 	 */
-	private boolean applyRRMConfig(
+	boolean applyRRMConfig(
 		String serialNumber,
 		UCentralApConfiguration config
 	) {
@@ -359,7 +425,287 @@ public class ConfigManager implements Runnable {
 			);
 		}
 
+		if (
+			deviceConfig.userChannelWidths != null &&
+				deviceConfig.userChannelWidths
+					.containsKey(UCentralConstants.BAND_2G)
+		) {
+			modified |= apply2gBandwidth(serialNumber, config, deviceConfig);
+		}
 		return modified;
+	}
+
+	/** Apply bandwidth independently so failure cannot suppress channel or power updates. */
+	private boolean apply2gBandwidth(
+		String serialNumber,
+		UCentralApConfiguration config,
+		DeviceConfig settings
+	) {
+		Integer width =
+			settings.userChannelWidths.get(UCentralConstants.BAND_2G);
+		DeviceData data =
+			deviceDataMap.computeIfAbsent(serialNumber, k -> new DeviceData());
+		if (width == null || (width != 20 && width != 40)) {
+			data.bandwidthRetryAfterNs = null;
+			logger.error(
+				"Device {}: invalid persisted bandwidth: {}",
+				serialNumber,
+				width
+			);
+			return false;
+		}
+		if (
+			data.bandwidthRetryAfterNs != null && width
+				.equals(data.bandwidthRetryWidth) &&
+				nanoTime.getAsLong() - data.bandwidthRetryAfterNs < 0
+		) {
+			retainZoneForRetry(serialNumber);
+			return false;
+		}
+		DeviceCapabilities capabilities;
+		try {
+			capabilities = client.getCapabilities(serialNumber);
+			if (capabilities == null) {
+				throw new IllegalStateException(
+					"Device capabilities are temporarily unavailable"
+				);
+			}
+		} catch (RuntimeException e) {
+			logger.warn(
+				"Device {}: cannot retrieve bandwidth capabilities: {}",
+				serialNumber,
+				e.getMessage()
+			);
+			data.bandwidthRetryWidth = width;
+			data.bandwidthRetryAfterNs = nextRetryTimeNs();
+			retainZoneForRetry(serialNumber);
+			return false;
+		}
+		data.bandwidthRetryAfterNs = null;
+		try {
+			// Validation only reads config. Change the width only after it succeeds.
+			validate2gBandwidth(config, settings, capabilities, width);
+			return UCentralUtils.setRadioConfigField(
+				serialNumber,
+				config,
+				"channel-width",
+				Collections.singletonMap(UCentralConstants.BAND_2G, width)
+			);
+		} catch (RuntimeException e) {
+			// Unsupported/malformed persisted settings do not schedule themselves again.
+			// A later config/capability event or periodic evaluation can revalidate them.
+			logger.error(
+				"Device {}: invalid bandwidth configuration: {}",
+				serialNumber,
+				e.getMessage()
+			);
+			return false;
+		}
+	}
+
+	private long nextRetryTimeNs() {
+		return nanoTime.getAsLong() +
+			Math.max(1L, params.updateIntervalMs) * 1_000_000L;
+	}
+
+	/** Retain work for the existing loop without interrupting its normal sleep. */
+	private void retainZoneForRetry(String serialNumber) {
+		String zone = deviceDataManager.getDeviceZone(serialNumber);
+		if (zone != null) {
+			zonesToUpdate.add(zone);
+		}
+	}
+
+	/** Persist a validated manual selection and enqueue the existing zone delivery pipeline. */
+	public synchronized boolean set2gBandwidth(
+		DeviceWithStatus device,
+		int width
+	) {
+		String serial = device.serialNumber;
+		DeviceConfig settings = deviceDataManager.getDeviceConfig(serial);
+		String zone = deviceDataManager.getDeviceZone(serial);
+		if (
+			!params.configEnabled || settings == null ||
+				!Boolean.TRUE.equals(settings.enableConfig) ||
+				!Boolean.TRUE.equals(settings.enableRRM) || zone == null
+		) {
+			throw new IllegalStateException(
+				"Configuration updates are disabled or the device has no RRM zone"
+			);
+		}
+		if (!device.connected) {
+			throw new IllegalStateException("Device is offline");
+		}
+		if (device.configuration == null) {
+			throw new IllegalArgumentException(
+				"Device radio configuration is unavailable"
+			);
+		}
+		UCentralApConfiguration config =
+			new UCentralApConfiguration(device.configuration);
+		validate2gBandwidth(
+			config,
+			settings,
+			client.getCapabilities(serial),
+			width
+		);
+		boolean changed = UCentralUtils.setRadioConfigField(
+			serial,
+			config,
+			"channel-width",
+			Collections.singletonMap(UCentralConstants.BAND_2G, width)
+		);
+		// AP maps follow the existing whole-field layer precedence. Preserve the
+		// effective values of other bands when creating the AP override.
+		deviceDataManager.updateDeviceApConfig(configs -> {
+			DeviceConfig ap =
+				configs.computeIfAbsent(serial, key -> new DeviceConfig());
+			Map<String, Integer> widths = new HashMap<>();
+			if (ap.userChannelWidths != null) {
+				widths.putAll(ap.userChannelWidths);
+			} else if (settings.userChannelWidths != null) {
+				widths.putAll(settings.userChannelWidths);
+			}
+			widths.put(UCentralConstants.BAND_2G, width);
+			ap.userChannelWidths = widths;
+		});
+		if (changed) {
+			queueZoneAndWakeUp(zone);
+		}
+		return changed;
+	}
+
+	/** Fail closed when radio, width or regulatory channel support cannot be established. */
+	static void validate2gBandwidth(
+		UCentralApConfiguration config,
+		DeviceConfig settings,
+		DeviceCapabilities capabilities,
+		int width
+	) {
+		if (width != 20 && width != 40) {
+			throw new IllegalArgumentException(
+				"Only HT20 and HT40 are supported"
+			);
+		}
+		List<Integer> allowed =
+			settings.allowedChannelWidths == null
+				? null
+				: settings.allowedChannelWidths.get(UCentralConstants.BAND_2G);
+		if (allowed != null && !allowed.contains(width)) {
+			throw new IllegalArgumentException(
+				"Bandwidth is disallowed by allowedChannelWidths"
+			);
+		}
+		JsonObject target = null;
+		for (int index = 0; index < config.getRadioCount(); index++) {
+			JsonObject radio = config.getRadioConfig(index);
+			if (
+				radio != null && radio.has("band") &&
+					"2G".equals(radio.get("band").getAsString())
+			) {
+				if (target != null) {
+					throw new IllegalArgumentException(
+						"Multiple 2.4 GHz radios cannot be targeted unambiguously"
+					);
+				}
+				target = radio;
+			}
+		}
+		if (target == null) {
+			throw new IllegalArgumentException("Device has no 2.4 GHz radio");
+		}
+		Capabilities.Phy phy = null;
+		if (
+			capabilities != null && capabilities.capabilities != null &&
+				capabilities.capabilities.wifi != null
+		) {
+			for (
+				Capabilities.Phy candidate : capabilities.capabilities.wifi
+					.values()
+			) {
+				if (
+					candidate != null && candidate.band != null &&
+						Arrays.asList(candidate.band).contains("2G")
+				) {
+					if (phy != null) {
+						throw new IllegalArgumentException(
+							"Ambiguous 2.4 GHz device capabilities"
+						);
+					}
+					phy = candidate;
+				}
+			}
+		}
+		if (
+			phy == null || phy.htmode == null || phy.channels == null ||
+				Arrays.stream(phy.htmode).noneMatch(mode -> mode != null && mode.matches("(?:HT|VHT|HE|EHT)" + width + "[+-]?"))
+		) {
+			throw new IllegalArgumentException(
+				"Bandwidth is unsupported or device capabilities are unavailable"
+			);
+		}
+		if (
+			!target.has("country") || phy.country == null ||
+				!phy.country.equalsIgnoreCase(target.get("country").getAsString())
+		) {
+			throw new IllegalArgumentException(
+				"Radio country must match the device regulatory capabilities"
+			);
+		}
+		Set<Integer> channels = new HashSet<>();
+		for (int channel : phy.channels) {
+			if (channel >= 1 && channel <= 14) {
+				channels.add(channel);
+			}
+		}
+		Integer selected = settings.userChannels == null
+			? null : settings.userChannels.get("2G");
+		if (selected == null && settings.autoChannels != null) {
+			selected = settings.autoChannels.get("2G");
+		}
+		JsonElement configured = target.get("channel");
+		if (
+			selected == null && configured != null &&
+				configured.isJsonPrimitive() &&
+				configured.getAsJsonPrimitive().isNumber()
+		) {
+			selected = configured.getAsInt();
+		}
+		Set<Integer> primaryChannels = new HashSet<>();
+		if (selected != null) {
+			primaryChannels.add(selected);
+		} else if (
+			configured != null && "auto".equals(configured.getAsString())
+		) {
+			if (target.has("valid-channels")) {
+				for (
+					JsonElement channel : target
+						.getAsJsonArray("valid-channels")
+				) {
+					primaryChannels.add(channel.getAsInt());
+				}
+			} else {
+				primaryChannels.addAll(channels);
+			}
+		} else {
+			throw new IllegalArgumentException(
+				"Cannot determine the configured primary channel"
+			);
+		}
+		if (primaryChannels.isEmpty()) {
+			throw new IllegalArgumentException("No supported primary channels");
+		}
+		for (int channel : primaryChannels) {
+			if (
+				!channels.contains(channel) || (width == 40 && (channel == 14 ||
+					!((channel + 4 <= 13 && channels.contains(channel + 4)) ||
+						(channel - 4 >= 1 && channels.contains(channel - 4)))))
+			) {
+				throw new IllegalArgumentException(
+					"Bandwidth is incompatible with the regulatory channel list"
+				);
+			}
+		}
 	}
 
 	/**

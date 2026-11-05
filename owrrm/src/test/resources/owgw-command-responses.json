@@ -1,0 +1,201 @@
+{
+  "provenance": "Synthetic test data for the current validator contract. NOT captured from deployed OWGW; gateway-version compatibility remains unverified.",
+  "cases": [
+    {
+      "name": "valid acknowledgment",
+      "httpStatus": 200,
+      "accepted": true,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "wifiscan",
+        "serialNumber": "dc62796520cd",
+        "submitted": 100,
+        "errorCode": 0,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "pending command",
+      "httpStatus": 200,
+      "accepted": true,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "wifiscan",
+        "serialNumber": "dc62796520cd",
+        "submitted": 100,
+        "errorCode": 0,
+        "status": "pending"
+      }
+    },
+    {
+      "name": "completed command",
+      "httpStatus": 200,
+      "accepted": true,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "wifiscan",
+        "serialNumber": "dc62796520cd",
+        "submitted": 100,
+        "errorCode": 0,
+        "status": "completed",
+        "completed": 101,
+        "results": {
+          "status": {
+            "error": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "rejected command",
+      "httpStatus": 200,
+      "accepted": false,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "wifiscan",
+        "serialNumber": "dc62796520cd",
+        "submitted": 100,
+        "errorCode": 0,
+        "status": "rejected"
+      }
+    },
+    {
+      "name": "top-level error",
+      "httpStatus": 200,
+      "accepted": false,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "wifiscan",
+        "serialNumber": "dc62796520cd",
+        "submitted": 100,
+        "errorCode": 1,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "embedded error",
+      "httpStatus": 200,
+      "accepted": false,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "wifiscan",
+        "serialNumber": "dc62796520cd",
+        "submitted": 100,
+        "errorCode": 0,
+        "status": "accepted",
+        "results": {
+          "status": {
+            "error": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "missing optional execution and result metadata",
+      "httpStatus": 200,
+      "accepted": true,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "wifiscan",
+        "serialNumber": "dc62796520cd",
+        "submitted": 100,
+        "status": "accepted",
+        "errorCode": 0
+      }
+    },
+    {
+      "name": "missing identity",
+      "httpStatus": 200,
+      "accepted": false,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "wifiscan",
+        "submitted": 100,
+        "errorCode": 0,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "mismatched command",
+      "httpStatus": 200,
+      "accepted": false,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "configure",
+        "serialNumber": "dc62796520cd",
+        "submitted": 100,
+        "errorCode": 0,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "missing UUID",
+      "httpStatus": 200,
+      "accepted": false,
+      "response": {
+        "command": "wifiscan",
+        "serialNumber": "dc62796520cd",
+        "submitted": 100,
+        "errorCode": 0,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "missing status",
+      "httpStatus": 200,
+      "accepted": false,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "wifiscan",
+        "serialNumber": "dc62796520cd",
+        "submitted": 100,
+        "errorCode": 0
+      }
+    },
+    {
+      "name": "missing timing",
+      "httpStatus": 200,
+      "accepted": false,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "wifiscan",
+        "serialNumber": "dc62796520cd",
+        "errorCode": 0,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "gateway timeout status",
+      "httpStatus": 200,
+      "accepted": false,
+      "response": {
+        "UUID": "synthetic-command",
+        "command": "wifiscan",
+        "serialNumber": "dc62796520cd",
+        "submitted": 100,
+        "errorCode": 0,
+        "status": "timedout"
+      }
+    },
+    {
+      "name": "HTTP timeout",
+      "httpStatus": 504,
+      "accepted": false,
+      "response": {
+        "errorCode": 1
+      }
+    },
+    {
+      "name": "null response",
+      "httpStatus": 200,
+      "accepted": false,
+      "response": null
+    },
+    {
+      "name": "empty response object",
+      "httpStatus": 200,
+      "accepted": false,
+      "response": {}
+    }
+  ]
+}

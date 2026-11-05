@@ -40,6 +40,44 @@ paths:
             application/json:
               schema:
                 type: object
+  /api/v1/getDeviceConfig:
+    get:
+      tags:
+      - Config
+      summary: Get device configuration
+      description: Returns the device configuration by applying all configuration
+        layers.
+      operationId: getDeviceConfig
+      parameters:
+      - name: serial
+        in: query
+        description: The device serial number
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: Device configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceConfig'
+        "400":
+          description: Bad Request
+  /api/v1/getDeviceLayeredConfig:
+    get:
+      tags:
+      - Config
+      summary: Get device layered configuration
+      description: Returns the device layered configuration.
+      operationId: getDeviceLayeredConfig
+      responses:
+        "200":
+          description: Device layered configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceLayeredConfig'
   /api/v1/device/{serialNumber}/zone:
     get:
       tags:
@@ -80,44 +118,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /api/v1/getDeviceConfig:
-    get:
-      tags:
-      - Config
-      summary: Get device configuration
-      description: Returns the device configuration by applying all configuration
-        layers.
-      operationId: getDeviceConfig
-      parameters:
-      - name: serial
-        in: query
-        description: The device serial number
-        required: true
-        schema:
-          type: string
-      responses:
-        "200":
-          description: Device configuration
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DeviceConfig'
-        "400":
-          description: Bad Request
-  /api/v1/getDeviceLayeredConfig:
-    get:
-      tags:
-      - Config
-      summary: Get device layered configuration
-      description: Returns the device layered configuration.
-      operationId: getDeviceLayeredConfig
-      responses:
-        "200":
-          description: Device layered configuration
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DeviceLayeredConfig'
   /api/v1/getTopology:
     get:
       tags:
@@ -139,6 +139,36 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /api/v1/device/{serialNumber}/wifiScanResults:
+    get:
+      tags:
+      - SDK
+      summary: Read the latest complete scan batch
+      description: Returns the complete batch with the greatest Kafka event timestamp.
+        Older events and equal-timestamp duplicates do not replace it.
+      operationId: getWifiScanResults
+      parameters:
+      - name: X-INTERNAL-NAME
+        in: header
+        required: true
+        schema:
+          type: string
+      - name: serialNumber
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: "Latest scan, which may be stale or empty"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WifiScanResults'
+        "404":
+          description: Unknown device or no scan history
+      security:
+      - internalServiceKey: []
   /api/v1/modifyDeviceApConfig:
     post:
       tags:
@@ -301,6 +331,34 @@ paths:
                 $ref: '#/components/schemas/AlgorithmResult'
         "400":
           description: Bad Request
+  /api/v1/device/{serialNumber}/wifiScan:
+    post:
+      tags:
+      - SDK
+      summary: Request an on-demand Wi-Fi scan
+      operationId: runWifiScan
+      parameters:
+      - name: X-INTERNAL-NAME
+        in: header
+        required: true
+        schema:
+          type: string
+      - name: serialNumber
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "202":
+          description: Scan command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WifiCommandResult'
+        "502":
+          description: OWGW rejected the command or returned an invalid acknowledgment
+      security:
+      - internalServiceKey: []
   /api/v1/setDeviceApConfig:
     post:
       tags:
@@ -424,8 +482,8 @@ paths:
       tags:
       - Config
       summary: Set device topology
-      description: Set the device topology. Internal service access only; valid
-        internal credentials are required.
+      description: Set the device topology. Internal service access only; valid internal
+        credentials are required.
       operationId: setTopology
       requestBody:
         description: The device topology
@@ -445,6 +503,42 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /api/v1/device/{serialNumber}/wifi/bandwidth:
+    put:
+      tags:
+      - Config
+      summary: Queue a manual 2.4 GHz channel width
+      operationId: setWifiBandwidth
+      parameters:
+      - name: X-INTERNAL-NAME
+        in: header
+        required: true
+        schema:
+          type: string
+      - name: serialNumber
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WifiBandwidthRequest'
+        required: true
+      responses:
+        "202":
+          description: Configuration accepted and queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WifiCommandResult'
+        "200":
+          description: Width already configured; override stored
+        "422":
+          description: "Unsupported bandwidth, radio or capabilities"
+      security:
+      - internalServiceKey: []
 components:
   schemas:
     Algorithm:
@@ -507,6 +601,11 @@ components:
           additionalProperties:
             type: integer
             format: int32
+        userChannelWidths:
+          type: object
+          additionalProperties:
+            type: integer
+            format: int32
         allowedTxPowers:
           type: object
           additionalProperties:
@@ -553,11 +652,8 @@ components:
             $ref: '#/components/schemas/DeviceConfig'
         networkConfig:
           $ref: '#/components/schemas/DeviceConfig'
-    DeviceTopology:
-      type: object
     DeviceZoneResult:
       type: object
-      description: Device RF zone lookup result
       properties:
         serialNumber:
           type: string
@@ -567,14 +663,53 @@ components:
           type: string
           description: The RF zone
           example: Lobby
+      description: Device RF zone lookup result
     ErrorResponse:
       type: object
-      description: Error response
       properties:
         error:
           type: string
           description: The error message
           example: Zone not found
+      description: Error response
+    DeviceTopology:
+      type: object
+    WifiNetwork:
+      type: object
+      properties:
+        ssid:
+          type: string
+        bssid:
+          type: string
+        channel:
+          type: integer
+          format: int32
+        signal:
+          type: integer
+          format: int32
+        encryption:
+          type: string
+          enum:
+          - OPEN
+          - WEP
+          - WPA
+          - WPA2
+          - WPA3
+          - WPA2/WPA3
+          - UNKNOWN
+    WifiScanResults:
+      required:
+      - networks
+      - timestamp
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        networks:
+          type: array
+          items:
+            $ref: '#/components/schemas/WifiNetwork'
     ChannelAllocation:
       type: object
       properties:
@@ -631,6 +766,28 @@ components:
             type: object
             additionalProperties:
               type: string
+    WifiCommandResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+    WifiBandwidthRequest:
+      required:
+      - band
+      - bandwidth
+      type: object
+      properties:
+        band:
+          type: string
+          enum:
+          - 2g
+        bandwidth:
+          type: string
+          enum:
+          - HT20
+          - HT40
     Certificate:
       type: object
       properties:
@@ -662,6 +819,10 @@ components:
           items:
             $ref: '#/components/schemas/Certificate'
   securitySchemes:
+    internalServiceKey:
+      type: apiKey
+      name: X-API-KEY
+      in: header
     bearerAuth:
       type: http
       scheme: bearer

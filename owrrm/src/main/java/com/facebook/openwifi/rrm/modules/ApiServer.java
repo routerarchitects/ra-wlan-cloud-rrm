@@ -13,6 +13,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnknownHostException;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -26,6 +27,7 @@ import javax.ws.rs.GET;
 import javax.ws.rs.POST;
 import javax.ws.rs.PUT;
 import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
 import javax.ws.rs.Produces;
 import javax.ws.rs.core.MediaType;
 
@@ -36,6 +38,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.facebook.openwifi.cloudsdk.UCentralClient;
+import com.facebook.openwifi.cloudsdk.UCentralUtils;
+import com.facebook.openwifi.cloudsdk.WifiScanEntry;
+import com.facebook.openwifi.cloudsdk.models.gw.CommandInfo;
+import com.facebook.openwifi.cloudsdk.models.gw.DeviceWithStatus;
 import com.facebook.openwifi.cloudsdk.models.gw.SystemInfoResults;
 import com.facebook.openwifi.cloudsdk.models.gw.TokenValidationResult;
 import com.facebook.openwifi.cloudsdk.models.prov.rrm.Algorithm;
@@ -59,6 +65,7 @@ import com.facebook.openwifi.rrm.optimizers.tpc.MeasurementBasedApApTPC;
 import com.facebook.openwifi.rrm.optimizers.tpc.MeasurementBasedApClientTPC;
 import com.facebook.openwifi.rrm.optimizers.tpc.RandomTxPowerInitializer;
 import com.google.gson.Gson;
+import com.google.gson.JsonParseException;
 import com.google.gson.GsonBuilder;
 
 import io.swagger.v3.core.util.Json;
@@ -69,6 +76,7 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.enums.ParameterIn;
 import io.swagger.v3.oas.annotations.enums.SecuritySchemeType;
+import io.swagger.v3.oas.annotations.enums.SecuritySchemeIn;
 import io.swagger.v3.oas.annotations.info.Info;
 import io.swagger.v3.oas.annotations.media.ArraySchema;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -108,6 +116,12 @@ import spark.embeddedserver.jetty.EmbeddedJettyFactory;
 	name = "bearerAuth",
 	type = SecuritySchemeType.HTTP,
 	scheme = "bearer"
+)
+@SecurityScheme(
+	name = "internalServiceKey",
+	type = SecuritySchemeType.APIKEY,
+	in = SecuritySchemeIn.HEADER,
+	paramName = "X-API-KEY"
 )
 public class ApiServer implements Runnable {
 	private static final Logger logger =
@@ -182,12 +196,16 @@ public class ApiServer implements Runnable {
 	@Schema(description = "Device RF zone lookup result")
 	public static class DeviceZoneResult {
 		/** The device serial number. */
-		@Schema(description = "The device serial number", example = "AP-001")
-		public String serialNumber;
+		@Schema(
+			description = "The device serial number",
+			example = "AP-001"
+		) public String serialNumber;
 
 		/** The RF zone. */
-		@Schema(description = "The RF zone", example = "Lobby")
-		public String zone;
+		@Schema(
+			description = "The RF zone",
+			example = "Lobby"
+		) public String zone;
 
 		/** Constructor. */
 		public DeviceZoneResult(String serialNumber, String zone) {
@@ -200,8 +218,10 @@ public class ApiServer implements Runnable {
 	@Schema(description = "Error response")
 	public static class ErrorResponse {
 		/** The error message. */
-		@Schema(description = "The error message", example = "Zone not found")
-		public String error;
+		@Schema(
+			description = "The error message",
+			example = "Zone not found"
+		) public String error;
 
 		/** Constructor. */
 		public ErrorResponse(String error) { this.error = error; }
@@ -342,6 +362,18 @@ public class ApiServer implements Runnable {
 			new ModifyDeviceApConfigEndpoint()
 		);
 		service.get("/api/v1/currentModel", new GetCurrentModelEndpoint());
+		service.put(
+			"/api/v1/device/:serialNumber/wifi/bandwidth",
+			new SetWifiBandwidthEndpoint()
+		);
+		service.post(
+			"/api/v1/device/:serialNumber/wifiScan",
+			new RunWifiScanEndpoint()
+		);
+		service.get(
+			"/api/v1/device/:serialNumber/wifiScanResults",
+			new GetWifiScanResultsEndpoint()
+		);
 		service.get("/api/v1/optimizeChannel", new OptimizeChannelEndpoint());
 		service.get("/api/v1/optimizeTxPower", new OptimizeTxPowerEndpoint());
 
@@ -393,24 +425,30 @@ public class ApiServer implements Runnable {
 		String path = request.pathInfo();
 		return path.equals("/api/v1/getTopology") ||
 			path.equals("/api/v1/setTopology") ||
-			path.matches("^/api/v1/device/[^/]+/zone$");
+			path.matches(
+				"^/api/v1/device/[^/]+/(?:zone|wifi/bandwidth|wifiScan|wifiScanResults)$"
+			);
 	}
 
 	/** Return true if the serial number matches Analytics routerId validation. */
 	private boolean isValidPathSafeSerialNumber(String serialNumber) {
-		if (serialNumber == null ||
-			serialNumber.isEmpty() ||
-			serialNumber.length() > 64) {
+		if (
+			serialNumber == null ||
+				serialNumber.isEmpty() ||
+				serialNumber.length() > 64
+		) {
 			return false;
 		}
 
 		for (int i = 0; i < serialNumber.length(); i++) {
 			char c = serialNumber.charAt(i);
-			if (!((c >= '0' && c <= '9') ||
-				(c >= 'A' && c <= 'Z') ||
-				(c >= 'a' && c <= 'z') ||
-				c == '-' ||
-				c == '_')) {
+			if (
+				!((c >= '0' && c <= '9') ||
+					(c >= 'A' && c <= 'Z') ||
+					(c >= 'a' && c <= 'z') ||
+					c == '-' ||
+					c == '_')
+			) {
 				return false;
 			}
 		}
@@ -996,6 +1034,346 @@ public class ApiServer implements Runnable {
 				return e.getMessage();
 			}
 			return "";
+		}
+	}
+
+	/** Command acceptance only; does not assert device-side completion. */
+	public static class WifiCommandResult {
+		public final boolean success = true;
+		public final String message;
+
+		public WifiCommandResult(String message) {
+			this.message = message;
+		}
+	}
+
+	/** Manual bandwidth request. */
+	public static class WifiBandwidthRequest {
+		@Schema(allowableValues = { "2g" }, required = true) public String band;
+		@Schema(
+			allowableValues = { "HT20", "HT40" },
+			required = true
+		) public String bandwidth;
+	}
+
+	/** Stable per-device scan response. Internal scan attributes stay private. */
+	public static class WifiScanResults {
+		@Schema(
+			format = "date-time",
+			required = true
+		) public final String timestamp;
+		@Schema(required = true) public final List<WifiNetwork> networks =
+			new ArrayList<>();
+
+		public WifiScanResults(Modeler.WifiScanBatch batch) {
+			timestamp = Instant.ofEpochMilli(batch.timestampMs).toString();
+			for (WifiScanEntry entry : batch.entries) {
+				networks.add(new WifiNetwork(entry));
+			}
+		}
+	}
+
+	/** Only the five public network fields in the MCP integration contract. */
+	public static class WifiNetwork {
+		public final String ssid;
+		public final String bssid;
+		public final int channel;
+		public final int signal;
+		@Schema(
+			allowableValues = { "OPEN",
+				"WEP",
+				"WPA",
+				"WPA2",
+				"WPA3",
+				"WPA2/WPA3",
+				"UNKNOWN" }
+		) public final String encryption;
+
+		public WifiNetwork(WifiScanEntry entry) {
+			ssid = entry.ssid == null ? "" : entry.ssid;
+			bssid = entry.bssid == null ? "" : entry.bssid;
+			channel = entry.channel;
+			signal = entry.signal;
+			encryption =
+				entry.encryption == null ? "UNKNOWN" : entry.encryption;
+		}
+	}
+
+	private static class WifiApiFailure extends RuntimeException {
+		final int status;
+
+		WifiApiFailure(int status, String message) {
+			super(message);
+			this.status = status;
+		}
+	}
+
+	/** Shared internal authentication and device isolation for Wi-Fi routes. */
+	public abstract class DeviceWifiEndpoint implements Route {
+		@Override
+		public final String handle(Request request, Response response) {
+			if (!isInternalRequest(request)) {
+				return jsonError(
+					response,
+					403,
+					"Endpoint restricted to internal inter-service communication"
+				);
+			}
+			if (!hasValidInternalServiceAuth(request)) {
+				return jsonError(response, 403, "Forbidden");
+			}
+			String serial = request.params(":serialNumber");
+			if (!isValidPathSafeSerialNumber(serial)) {
+				return jsonError(response, 400, "Invalid serial number");
+			}
+			if (!deviceDataManager.isDeviceInTopology(serial)) {
+				return jsonError(response, 404, "Device not found");
+			}
+			try {
+				Object result = execute(serial, request, response);
+				response.type(MediaType.APPLICATION_JSON);
+				return gson.toJson(result);
+			} catch (WifiApiFailure e) {
+				return jsonError(response, e.status, e.getMessage());
+			} catch (JsonParseException e) {
+				return jsonError(response, 400, "Invalid JSON request");
+			} catch (IllegalArgumentException e) {
+				return jsonError(response, 422, e.getMessage());
+			} catch (IllegalStateException e) {
+				return jsonError(response, 409, e.getMessage());
+			} catch (RuntimeException e) {
+				logger.error("Device {}: Wi-Fi operation failed", serial, e);
+				for (
+					Throwable cause = e; cause != null; cause = cause.getCause()
+				) {
+					if (
+						cause instanceof java.net.SocketTimeoutException ||
+							cause instanceof java.util.concurrent.TimeoutException
+					) {
+						return jsonError(
+							response,
+							504,
+							"OWGW command timed out; acceptance is unknown"
+						);
+					}
+				}
+				return jsonError(response, 502, "OWGW request failed");
+			}
+		}
+
+		protected abstract Object execute(
+			String serial,
+			Request request,
+			Response response
+		);
+	}
+
+	private DeviceWithStatus getConnectedWifiDevice(String serial) {
+		List<DeviceWithStatus> devices = client.getDevices();
+		if (devices == null) {
+			throw new WifiApiFailure(503, "OWGW inventory unavailable");
+		}
+		for (DeviceWithStatus device : devices) {
+			if (device != null && serial.equals(device.serialNumber)) {
+				if (!device.connected) {
+					throw new WifiApiFailure(409, "Device is offline");
+				}
+				return device;
+			}
+		}
+		throw new WifiApiFailure(404, "Device not found in OWGW inventory");
+	}
+
+	@Path("/api/v1/device/{serialNumber}/wifi/bandwidth")
+	public class SetWifiBandwidthEndpoint extends DeviceWifiEndpoint {
+		@PUT
+		@Produces(MediaType.APPLICATION_JSON)
+		@Operation(
+			operationId = "setWifiBandwidth",
+			summary = "Queue a manual 2.4 GHz channel width",
+			tags = { "Config" },
+			security = @SecurityRequirement(name = "internalServiceKey"),
+			parameters = @Parameter(
+				name = "X-INTERNAL-NAME",
+				in = ParameterIn.HEADER,
+				required = true,
+				schema = @Schema(type = "string")
+			),
+			requestBody = @RequestBody(
+				required = true,
+				content = @Content(
+					mediaType = "application/json",
+					schema = @Schema(implementation = WifiBandwidthRequest.class)
+				)
+			),
+			responses = { @ApiResponse(
+				responseCode = "202",
+				description = "Configuration accepted and queued",
+				content = @Content(
+					schema = @Schema(implementation = WifiCommandResult.class)
+				)
+			),
+				@ApiResponse(
+					responseCode = "200",
+					description = "Width already configured; override stored"
+				),
+				@ApiResponse(
+					responseCode = "422",
+					description = "Unsupported bandwidth, radio or capabilities"
+				) }
+		)
+		@Override
+		public Object execute(
+			@PathParam(
+				"serialNumber"
+			) String serial,
+			@Parameter(hidden = true) Request request,
+			@Parameter(hidden = true) Response response
+		) {
+			WifiBandwidthRequest body =
+				gson.fromJson(request.body(), WifiBandwidthRequest.class);
+			if (
+				body == null || !"2g".equals(body.band) ||
+					!("HT20".equals(body.bandwidth) || "HT40".equals(body.bandwidth))
+			) {
+				throw new WifiApiFailure(
+					400,
+					"Expected band 2g and bandwidth HT20 or HT40"
+				);
+			}
+			DeviceWithStatus device = getConnectedWifiDevice(serial);
+			boolean queued;
+			try {
+				queued = configManager.set2gBandwidth(
+					device,
+					"HT20".equals(body.bandwidth) ? 20 : 40
+				);
+			} catch (IllegalArgumentException | IllegalStateException e) {
+				throw e;
+			} catch (RuntimeException e) {
+				logger.error(
+					"Device {}: could not persist or queue bandwidth",
+					serial,
+					e
+				);
+				throw new WifiApiFailure(
+					500,
+					"Could not persist or queue bandwidth configuration"
+				);
+			}
+			response.status(queued ? 202 : 200);
+			return new WifiCommandResult(
+				queued
+					? "Wi-Fi bandwidth config command accepted"
+					: "Wi-Fi bandwidth already configured; user override accepted"
+			);
+		}
+	}
+
+	@Path("/api/v1/device/{serialNumber}/wifiScan")
+	public class RunWifiScanEndpoint extends DeviceWifiEndpoint {
+		@POST
+		@Produces(MediaType.APPLICATION_JSON)
+		@Operation(
+			operationId = "runWifiScan",
+			summary = "Request an on-demand Wi-Fi scan",
+			tags = { "SDK" },
+			security = @SecurityRequirement(name = "internalServiceKey"),
+			parameters = @Parameter(
+				name = "X-INTERNAL-NAME",
+				in = ParameterIn.HEADER,
+				required = true,
+				schema = @Schema(type = "string")
+			),
+			responses = { @ApiResponse(
+				responseCode = "202",
+				description = "Scan command accepted",
+				content = @Content(
+					schema = @Schema(implementation = WifiCommandResult.class)
+				)
+			),
+				@ApiResponse(
+					responseCode = "502",
+					description = "OWGW rejected the command or returned an invalid acknowledgment"
+				) }
+		)
+		@Override
+		public Object execute(
+			@PathParam(
+				"serialNumber"
+			) String serial,
+			@Parameter(hidden = true) Request request,
+			@Parameter(hidden = true) Response response
+		) {
+			getConnectedWifiDevice(serial);
+			if (
+				!Boolean.TRUE
+					.equals(deviceDataManager.getDeviceConfig(serial).enableRRM)
+			) {
+				throw new WifiApiFailure(
+					409,
+					"RRM is disabled; scan ingestion is unavailable for this device"
+				);
+			}
+			// enableWifiScan controls automatic scheduling only. Manual scans use
+			// the same client and Kafka ingestion, without starting a second scan.
+			CommandInfo result = client.wifiScan(serial, false);
+			if (result != null && "timedout".equalsIgnoreCase(result.status)) {
+				throw new WifiApiFailure(504, "OWGW scan command timed out");
+			}
+			if (!UCentralUtils.isCommandAccepted(result, serial, "wifiscan")) {
+				throw new WifiApiFailure(
+					502,
+					"OWGW rejected the scan or returned an invalid acknowledgment"
+				);
+			}
+			response.status(202);
+			return new WifiCommandResult("Channel scan started");
+		}
+	}
+
+	@Path("/api/v1/device/{serialNumber}/wifiScanResults")
+	public class GetWifiScanResultsEndpoint extends DeviceWifiEndpoint {
+		@GET
+		@Produces(MediaType.APPLICATION_JSON)
+		@Operation(
+			operationId = "getWifiScanResults",
+			summary = "Read the latest complete scan batch",
+			description = "Returns the complete batch with the greatest Kafka event timestamp. " +
+				"Older events and equal-timestamp duplicates do not replace it.",
+			tags = { "SDK" },
+			security = @SecurityRequirement(name = "internalServiceKey"),
+			parameters = @Parameter(
+				name = "X-INTERNAL-NAME",
+				in = ParameterIn.HEADER,
+				required = true,
+				schema = @Schema(type = "string")
+			),
+			responses = { @ApiResponse(
+				responseCode = "200",
+				description = "Latest scan, which may be stale or empty",
+				content = @Content(
+					schema = @Schema(implementation = WifiScanResults.class)
+				)
+			),
+				@ApiResponse(
+					responseCode = "404",
+					description = "Unknown device or no scan history"
+				) }
+		)
+		@Override
+		public Object execute(
+			@PathParam(
+				"serialNumber"
+			) String serial,
+			@Parameter(hidden = true) Request request,
+			@Parameter(hidden = true) Response response
+		) {
+			Modeler.WifiScanBatch batch = modeler.getLatestWifiScan(serial);
+			if (batch == null) {
+				throw new WifiApiFailure(404, "No scan history for device");
+			}
+			return new WifiScanResults(batch);
 		}
 	}
 

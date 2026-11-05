@@ -43,8 +43,12 @@ import com.facebook.openwifi.rrm.RRMConfig;
 import com.facebook.openwifi.rrm.VersionProvider;
 import com.facebook.openwifi.rrm.mysql.DatabaseManager;
 import com.facebook.openwifi.rrm.services.MockOWSecService;
+import com.facebook.openwifi.rrm.services.MockOWGWService;
+import com.facebook.openwifi.cloudsdk.UCentralApConfiguration;
 import com.facebook.openwifi.rrm.Utils;
 import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.facebook.openwifi.cloudsdk.kafka.UCentralKafkaConsumer.KafkaRecord;
 
 import kong.unirest.HttpResponse;
 import kong.unirest.JsonNode;
@@ -84,6 +88,8 @@ public class ApiServerTest {
 
 	/** Test modeler instance. */
 	private Modeler modeler;
+	private TestWifiClient wifiClient;
+	private ConfigManager configManager;
 
 	/** The Gson instance. */
 	private final Gson gson = new Gson();
@@ -113,7 +119,8 @@ public class ApiServerTest {
 		rrmConfig.moduleConfig.apiServerParams.externalHttpPort =
 			TEST_EXTERNAL_PORT;
 
-		UCentralClient client = null;
+		this.wifiClient = new TestWifiClient();
+		UCentralClient client = wifiClient;
 
 		boolean useAuth = testInfo.getTags().contains("auth");
 		if (useAuth) {
@@ -127,16 +134,6 @@ public class ApiServerTest {
 			}
 
 			// Create uCentral client with mock services as necessary
-			client = new UCentralClient(
-				"rrm",
-				false,
-				null,
-				null,
-				null,
-				rrmConfig.uCentralConfig.uCentralSocketParams.connectTimeoutMs,
-				rrmConfig.uCentralConfig.uCentralSocketParams.socketTimeoutMs,
-				rrmConfig.uCentralConfig.uCentralSocketParams.wifiScanTimeoutMs
-			);
 			ServiceEvent owsecServiceEvent = new ServiceEvent();
 			owsecServiceEvent.type = "owsec";
 			owsecServiceEvent.privateEndPoint =
@@ -155,7 +152,7 @@ public class ApiServerTest {
 		);
 
 		// Instantiate dependent instances
-		ConfigManager configManager = new ConfigManager(
+		this.configManager = new ConfigManager(
 			rrmConfig.moduleConfig.configManagerParams,
 			deviceDataManager,
 			client
@@ -386,7 +383,10 @@ public class ApiServerTest {
 		assertTrue(
 			resp.getHeaders().getFirst("Content-Type").startsWith("application/json")
 		);
-		assertEquals(deviceA1, resp.getBody().getObject().getString("serialNumber"));
+		assertEquals(
+			deviceA1,
+			resp.getBody().getObject().getString("serialNumber")
+		);
 		assertEquals(zoneA, resp.getBody().getObject().getString("zone"));
 
 		resp = Unirest.get(url + "/" + deviceA2 + "/zone")
@@ -398,7 +398,8 @@ public class ApiServerTest {
 
 		DeviceTopology movedTopology = new DeviceTopology();
 		movedTopology.put(zoneA, new TreeSet<>(Arrays.asList(deviceA1)));
-		movedTopology.put(zoneB, new TreeSet<>(Arrays.asList(deviceA2, deviceB1)));
+		movedTopology
+			.put(zoneB, new TreeSet<>(Arrays.asList(deviceA2, deviceB1)));
 		deviceDataManager.setTopology(movedTopology);
 		resp = Unirest.get(url + "/" + deviceA2 + "/zone")
 			.header("X-INTERNAL-NAME", "internal_name")
@@ -687,6 +688,380 @@ public class ApiServerTest {
 		);
 	}
 
+	private void wifiTopology() {
+		DeviceTopology topology = new DeviceTopology();
+		topology.put(
+			"wifi-zone",
+			new TreeSet<>(Arrays.asList(TestWifiClient.SERIAL, "other-device"))
+		);
+		deviceDataManager.setTopology(topology);
+	}
+
+	private kong.unirest.HttpRequestWithBody wifiPut(String serial) {
+		return Unirest
+			.put(endpoint("/api/v1/device/" + serial + "/wifi/bandwidth"))
+			.header("X-INTERNAL-NAME", "mcp-test")
+			.header(
+				"X-API-KEY",
+				Utils.generateServiceKey(rrmConfig.serviceConfig)
+			)
+			.header("Content-Type", "application/json");
+	}
+
+	private kong.unirest.HttpRequestWithBody wifiPost() {
+		return Unirest.post(
+			endpoint("/api/v1/device/" + TestWifiClient.SERIAL + "/wifiScan")
+		)
+			.header("X-INTERNAL-NAME", "mcp-test")
+			.header(
+				"X-API-KEY",
+				Utils.generateServiceKey(rrmConfig.serviceConfig)
+			);
+	}
+
+	private HttpResponse<String> wifiResults(String serial) {
+		return Unirest
+			.get(endpoint("/api/v1/device/" + serial + "/wifiScanResults"))
+			.header("X-INTERNAL-NAME", "mcp-test")
+			.header(
+				"X-API-KEY",
+				Utils.generateServiceKey(rrmConfig.serviceConfig)
+			)
+			.asString();
+	}
+
+	@Test
+	void wifiBandwidthHttpContract() {
+		wifiTopology();
+		assertEquals(
+			200,
+			wifiPut(TestWifiClient.SERIAL).body("{\"band\":\"2g\",\"bandwidth\":\"HT20\"}").asString().getStatus()
+		);
+		HttpResponse<String> accepted = wifiPut(TestWifiClient.SERIAL)
+			.body("{\"band\":\"2g\",\"bandwidth\":\"HT40\"}")
+			.asString();
+		assertEquals(202, accepted.getStatus());
+		assertTrue(new JSONObject(accepted.getBody()).getBoolean("success"));
+		configManager.runImpl();
+		assertEquals(1, wifiClient.configurations.size());
+		for (
+			String body : Arrays.asList(
+				"null",
+				"{}",
+				"[]",
+				"bad json",
+				"{\"band\":\"5g\",\"bandwidth\":\"HT40\"}",
+				"{\"band\":\"2g\",\"bandwidth\":\"HT80\"}",
+				"{\"band\":\"2g\",\"bandwidth\":\"invalid\"}"
+			)
+		) {
+			assertEquals(
+				400,
+				wifiPut(TestWifiClient.SERIAL).body(body).asString().getStatus(), body
+			);
+		}
+		assertEquals(404, wifiPut("unknown").body("{}").asString().getStatus());
+		assertEquals(
+			400,
+			wifiPut("bad.serial").body("{}").asString().getStatus()
+		);
+		rrmConfig.moduleConfig.configManagerParams.configEnabled = false;
+		assertEquals(
+			409,
+			wifiPut(TestWifiClient.SERIAL).body("{\"band\":\"2g\",\"bandwidth\":\"HT40\"}").asString().getStatus()
+		);
+	}
+
+	@Test
+	void wifiBandwidthEndpointPersistsAndDeliversUsingRealSdkToMockGateway()
+		throws Exception {
+		wifiTopology();
+		try (MockOWGWService gateway = new MockOWGWService()) {
+			gateway.connect(wifiClient);
+			wifiClient.useHttpCommands = true;
+			gateway.responseBody =
+				"{\"errorCode\":0,\"status\":\"gateway-specific-success\"}";
+			assertEquals(
+				202,
+				wifiPut(TestWifiClient.SERIAL)
+					.body("{\"band\":\"2g\",\"bandwidth\":\"HT40\"}")
+					.asString()
+					.getStatus()
+			);
+			assertEquals(
+				40,
+				deviceDataManager.getDeviceConfig(TestWifiClient.SERIAL).userChannelWidths.get("2G")
+			);
+			configManager.runImpl();
+			assertEquals(1, gateway.calls.get());
+			assertEquals(
+				"/api/v1/device/" + TestWifiClient.SERIAL + "/configure",
+				gateway.requestPath
+			);
+			UCentralApConfiguration delivered = new UCentralApConfiguration(
+				gateway.requestBody.get("configuration").getAsString()
+			);
+			assertEquals(
+				40,
+				delivered.getRadioConfig(0).get("channel-width").getAsInt()
+			);
+			assertEquals(
+				6,
+				delivered.getRadioConfig(0).get("channel").getAsInt()
+			);
+			assertEquals(
+				17,
+				delivered.getRadioConfig(0).get("tx-power").getAsInt()
+			);
+			assertEquals(
+				TestWifiClient.SERIAL,
+				gateway.requestBody.get("serialNumber").getAsString()
+			);
+			assertEquals("synthetic-gateway-key", gateway.apiKey);
+		}
+	}
+
+	@Test
+	void wifiScanEndpointUsesRealSdkAgainstMockGateway() throws Exception {
+		wifiTopology();
+		try (MockOWGWService gateway = new MockOWGWService()) {
+			gateway.connect(wifiClient);
+			wifiClient.useHttpCommands = true;
+			gateway.responseBody =
+				gson.toJson(TestWifiClient.accepted("wifiscan"));
+			assertEquals(202, wifiPost().asString().getStatus());
+			assertEquals(1, gateway.calls.get());
+			assertFalse(gateway.requestBody.get("verbose").getAsBoolean());
+			gateway.responseBody = "{\"errorCode\":1}";
+			assertEquals(502, wifiPost().asString().getStatus());
+			gateway.responseBody = "null";
+			assertEquals(502, wifiPost().asString().getStatus());
+			gateway.responseBody = "{\"errorCode\":0,\"status\":\"timedout\"}";
+			assertEquals(504, wifiPost().asString().getStatus());
+			assertEquals(4, gateway.calls.get());
+		}
+	}
+
+	@Test
+	void wifiScanCommandAcceptanceAndFailures() {
+		wifiTopology();
+		String key = Utils.generateServiceKey(rrmConfig.serviceConfig);
+		assertEquals(
+			404,
+			Unirest.post(endpoint("/api/v1/device/unknown/wifiScan"))
+				.header("X-INTERNAL-NAME", "mcp-test")
+				.header("X-API-KEY", key)
+				.asString()
+				.getStatus()
+		);
+		assertEquals(
+			400,
+			Unirest.post(endpoint("/api/v1/device/bad.serial/wifiScan"))
+				.header("X-INTERNAL-NAME", "mcp-test")
+				.header("X-API-KEY", key)
+				.asString()
+				.getStatus()
+		);
+		DeviceConfig settings = new DeviceConfig();
+		settings.enableWifiScan = false;
+		deviceDataManager.setDeviceApConfig(TestWifiClient.SERIAL, settings);
+		assertEquals(202, wifiPost().asString().getStatus());
+		assertEquals(1, wifiClient.scanCalls);
+		assertFalse(wifiClient.scanVerbose);
+		wifiClient.scanResult.status = null;
+		assertEquals(502, wifiPost().asString().getStatus());
+		wifiClient.scanResult.status = "pending";
+		wifiClient.scanResult.errorCode = 1;
+		assertEquals(502, wifiPost().asString().getStatus());
+		wifiClient.scanResult = null;
+		assertEquals(502, wifiPost().asString().getStatus());
+		wifiClient.scanResult =
+			new com.facebook.openwifi.cloudsdk.models.gw.CommandInfo();
+		assertEquals(502, wifiPost().asString().getStatus());
+		wifiClient.scanResult = TestWifiClient.accepted("wifiscan");
+		wifiClient.scanResult.serialNumber = "other-device";
+		assertEquals(502, wifiPost().asString().getStatus());
+		wifiClient.scanResult.serialNumber = TestWifiClient.SERIAL;
+		wifiClient.scanResult.status = "failed";
+		assertEquals(502, wifiPost().asString().getStatus());
+		wifiClient.scanResult.status = "timedout";
+		assertEquals(504, wifiPost().asString().getStatus());
+		wifiClient.scanFailure =
+			new RuntimeException(new java.net.SocketTimeoutException("test"));
+		assertEquals(504, wifiPost().asString().getStatus());
+		wifiClient.scanFailure = new RuntimeException("connection refused");
+		assertEquals(502, wifiPost().asString().getStatus());
+		wifiClient.scanFailure = null;
+		wifiClient.devices.get(0).connected = false;
+		int calls = wifiClient.scanCalls;
+		assertEquals(409, wifiPost().asString().getStatus());
+		assertEquals(calls, wifiClient.scanCalls);
+		wifiClient.devices = null;
+		assertEquals(503, wifiPost().asString().getStatus());
+	}
+
+	@Test
+	void wifiResultsMapOnlyLatestDeviceBatchIncludingEmptyAndStale() {
+		wifiTopology();
+		assertEquals(404, wifiResults(TestWifiClient.SERIAL).getStatus());
+		assertEquals(202, wifiPost().asString().getStatus());
+		String payload =
+			"{\"status\":{\"scan\":[{\"ssid\":\"ExampleSSID\",\"bssid\":\"AA:BB:CC:DD:EE:FF\",\"channel\":6,\"signal\":-55,\"capability\":0,\"ies\":[]}]}}";
+		long timestamp =
+			java.time.Instant.parse("2026-07-09T06:00:00Z").toEpochMilli();
+		modeler.processData(
+			modeler.new InputData(
+				Modeler.InputDataType.WIFISCAN,
+				Arrays.asList(
+					new KafkaRecord(
+						TestWifiClient.SERIAL,
+						gson.fromJson(payload, JsonObject.class),
+						timestamp
+					)
+				)
+			)
+		);
+		HttpResponse<String> response = wifiResults(TestWifiClient.SERIAL);
+		assertEquals(200, response.getStatus());
+		JSONObject result = new JSONObject(response.getBody());
+		assertEquals(
+			new TreeSet<>(Arrays.asList("timestamp", "networks")),
+			result.keySet()
+		);
+		assertEquals("2026-07-09T06:00:00Z", result.getString("timestamp"));
+		JSONObject network = result.getJSONArray("networks").getJSONObject(0);
+		assertEquals(
+			new TreeSet<>(
+				Arrays.asList("ssid", "bssid", "channel", "signal", "encryption")
+			),
+			network.keySet()
+		);
+		assertEquals("ExampleSSID", network.getString("ssid"));
+		assertEquals("AA:BB:CC:DD:EE:FF", network.getString("bssid"));
+		assertEquals(6, network.getInt("channel"));
+		assertEquals(-55, network.getInt("signal"));
+		assertEquals("OPEN", network.getString("encryption"));
+		// An older scan arriving later must not replace the API snapshot.
+		modeler.processData(
+			modeler.new InputData(
+				Modeler.InputDataType.WIFISCAN,
+				Arrays.asList(
+					new KafkaRecord(
+						TestWifiClient.SERIAL,
+						gson.fromJson(
+							"{\"status\":{\"scan\":[]}}",
+							JsonObject.class
+						),
+						timestamp - 500
+					)
+				)
+			)
+		);
+		assertEquals(
+			result.toMap(),
+			new JSONObject(wifiResults(TestWifiClient.SERIAL).getBody()).toMap()
+		);
+		assertEquals(404, wifiResults("other-device").getStatus());
+		assertEquals(404, wifiResults("unknown").getStatus());
+		modeler.processData(
+			modeler.new InputData(
+				Modeler.InputDataType.WIFISCAN,
+				Arrays.asList(
+					new KafkaRecord(
+						TestWifiClient.SERIAL,
+						gson.fromJson(
+							"{\"status\":{\"scan\":[]}}",
+							JsonObject.class
+						),
+						timestamp + 1
+					)
+				)
+			)
+		);
+		result = new JSONObject(wifiResults(TestWifiClient.SERIAL).getBody());
+		assertEquals("2026-07-09T06:00:00.001Z", result.getString("timestamp"));
+		assertTrue(result.getJSONArray("networks").isEmpty());
+		assertEquals(1, wifiClient.scanCalls);
+	}
+
+	@Test
+	@Tag("auth")
+	void wifiEndpointsAlwaysRequirePrivateListenerAndServiceCredentials() {
+		wifiTopology();
+		String base = "/api/v1/device/" + TestWifiClient.SERIAL;
+		String key = Utils.generateServiceKey(rrmConfig.serviceConfig);
+		for (boolean internal : Arrays.asList(true, false)) {
+			assertEquals(
+				403,
+				Unirest.get(endpoint(base + "/wifiScanResults", internal)).asString().getStatus()
+			);
+			assertEquals(
+				403,
+				Unirest.post(endpoint(base + "/wifiScan", internal)).asString().getStatus()
+			);
+			assertEquals(
+				403,
+				Unirest.put(endpoint(base + "/wifi/bandwidth", internal)).body("{}").asString().getStatus()
+			);
+		}
+		assertEquals(
+			403,
+			Unirest.get(endpoint(base + "/wifiScanResults"))
+				.header("X-INTERNAL-NAME", "mcp-test")
+				.header("X-API-KEY", "invalid")
+				.asString()
+				.getStatus()
+		);
+		assertEquals(
+			403,
+			Unirest.post(endpoint(base + "/wifiScan", false))
+				.header("X-INTERNAL-NAME", "mcp-test")
+				.header("X-API-KEY", key)
+				.header("X-Forwarded-Port", String.valueOf(TEST_INTERNAL_PORT))
+				.asString()
+				.getStatus()
+		);
+		assertEquals(0, wifiClient.scanCalls);
+		owSecService.addToken("wifi-test-token", 300);
+		assertEquals(
+			403,
+			Unirest.get(endpoint(base + "/wifiScanResults", false))
+				.header("Authorization", "Bearer wifi-test-token")
+				.asString()
+				.getStatus()
+		);
+	}
+
+	@Test
+	void wifiBandwidthRejectsUnsupportedRadioAndPolicy() {
+		wifiTopology();
+		String body = "{\"band\":\"2g\",\"bandwidth\":\"HT40\"}";
+		DeviceConfig settings = new DeviceConfig();
+		settings.allowedChannelWidths =
+			java.util.Collections.singletonMap("2G", Arrays.asList(20));
+		deviceDataManager.setDeviceApConfig(TestWifiClient.SERIAL, settings);
+		assertEquals(
+			422,
+			wifiPut(TestWifiClient.SERIAL).body(body).asString().getStatus()
+		);
+		deviceDataManager.setDeviceApConfig(TestWifiClient.SERIAL, null);
+		wifiClient.capabilities.capabilities.wifi.get("phy0").htmode =
+			new String[] { "HT20" };
+		assertEquals(
+			422,
+			wifiPut(TestWifiClient.SERIAL).body(body).asString().getStatus()
+		);
+		wifiClient.devices.get(0).configuration.getAsJsonArray("radios")
+			.remove(0);
+		assertEquals(
+			422,
+			wifiPut(TestWifiClient.SERIAL).body(body).asString().getStatus()
+		);
+		assertNull(
+			deviceDataManager.getDeviceConfig(TestWifiClient.SERIAL).userChannelWidths
+		);
+	}
+
 	@Test
 	@Order(100)
 	void test_currentModel() throws Exception {
@@ -805,6 +1180,16 @@ public class ApiServerTest {
 		assertFalse(paths.isEmpty());
 		assertTrue(paths.keys().next().startsWith("/api/"));
 		assertTrue(paths.has("/api/v1/device/{serialNumber}/zone"));
+		JSONObject scans = paths
+			.getJSONObject("/api/v1/device/{serialNumber}/wifiScan")
+			.getJSONObject("post");
+		assertFalse(scans.has("requestBody"));
+		JSONObject results = paths
+			.getJSONObject("/api/v1/device/{serialNumber}/wifiScanResults")
+			.getJSONObject("get");
+		assertFalse(results.has("requestBody"));
+		assertTrue(results.has("parameters"));
+		assertTrue(paths.has("/api/v1/device/{serialNumber}/wifi/bandwidth"));
 	}
 
 	@Test
@@ -1117,6 +1502,9 @@ public class ApiServerTest {
 			.body(gson.toJson(updatedTopology))
 			.asString();
 		assertEquals(200, resp.getStatus());
-		assertEquals(gson.toJson(updatedTopology), deviceDataManager.getTopologyJson());
+		assertEquals(
+			gson.toJson(updatedTopology),
+			deviceDataManager.getTopologyJson()
+		);
 	}
 }

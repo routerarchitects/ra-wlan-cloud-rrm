@@ -623,14 +623,22 @@ public class DeviceDataManager {
 	public void updateDeviceApConfig(DeviceApConfigFunction fn) {
 		Lock l = deviceLayeredConfigLock.writeLock();
 		l.lock();
+		DeviceLayeredConfig previous = deviceLayeredConfig;
 		try {
+			// Publish only after persistence succeeds. A failed manual operation
+			// must not leave an in-memory override eligible for later delivery.
+			deviceLayeredConfig =
+				Utils.deepCopy(previous, DeviceLayeredConfig.class);
 			fn.update(deviceLayeredConfig.apConfig);
 			sanitizeDeviceLayeredConfig(deviceLayeredConfig);
+			saveDeviceLayeredConfig();
+			cachedDeviceConfigs.clear();
+		} catch (RuntimeException e) {
+			deviceLayeredConfig = previous;
+			throw e;
 		} finally {
 			l.unlock();
 		}
-		cachedDeviceConfigs.clear();
-		saveDeviceLayeredConfig();
 	}
 
 	/**

@@ -35,5 +35,8 @@ service configuration (`moduleConfig.apiServerParams`). An auto-generated
 OpenAPI 3.0 document is hosted at the endpoints `/openapi.{yaml,json}` and is
 written to [openapi.yaml](openapi.yaml) during the Maven "compile" phase.
 
+See [WIFI_APIS.md](WIFI_APIS.md) for the internal per-device bandwidth, scan
+command, and scan-result APIs and their Mango MCP integration contract.
+
 
 [JUnit 5]: https://junit.org/junit5/

@@ -9,6 +9,7 @@
 package com.facebook.openwifi.rrm.modules;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -61,7 +62,7 @@ public class Modeler implements Runnable {
 	public enum InputDataType { STATE, WIFISCAN }
 
 	/** Kafka input data wrapper. */
-	private class InputData {
+	class InputData {
 		/** Data type. */
 		public final InputDataType type;
 
@@ -110,6 +111,34 @@ public class Modeler implements Runnable {
 
 	/** The data model. */
 	public DataModel dataModel = new DataModel();
+
+	/** Atomic snapshots for API reads, including completed scans with no entries. */
+	private final Map<String, WifiScanBatch> latestScanBatches =
+		new ConcurrentHashMap<>();
+
+	/** A complete scan event. Published only after every entry parses successfully. */
+	public static final class WifiScanBatch {
+		public final long timestampMs;
+		public final List<WifiScanEntry> entries;
+
+		private WifiScanBatch(long timestampMs, List<WifiScanEntry> entries) {
+			this.timestampMs = timestampMs;
+			this.entries = Collections.unmodifiableList(entries);
+		}
+	}
+
+	/** Return an isolated complete scan with the greatest Kafka event timestamp. */
+	public WifiScanBatch getLatestWifiScan(String serialNumber) {
+		WifiScanBatch batch = latestScanBatches.get(serialNumber);
+		if (batch == null) {
+			return null;
+		}
+		List<WifiScanEntry> entries = new ArrayList<>();
+		for (WifiScanEntry entry : batch.entries) {
+			entries.add(new WifiScanEntry(entry));
+		}
+		return new WifiScanBatch(batch.timestampMs, entries);
+	}
 
 	/** The Gson instance. */
 	private final Gson gson = new Gson();
@@ -304,7 +333,7 @@ public class Modeler implements Runnable {
 	}
 
 	/** Process input data. */
-	private void processData(InputData data) {
+	void processData(InputData data) {
 		// for logging only
 		Set<String> stateUpdates = new TreeSet<>();
 		Set<String> wifiScanUpdates = new TreeSet<>();
@@ -346,12 +375,9 @@ public class Modeler implements Runnable {
 			break;
 		case WIFISCAN:
 			for (KafkaRecord record : data.records) {
-				List<List<WifiScanEntry>> wifiScanList =
-					dataModel.latestWifiScans.computeIfAbsent(
-						record.serialNumber,
-						k -> new LinkedList<>()
-					);
-
+				if (record.timestampMs <= 0) {
+					continue;
+				}
 				// Parse and validate this record
 				List<WifiScanEntry> scanEntries = UCentralUtils
 					.parseWifiScanEntries(record.payload, record.timestampMs);
@@ -359,11 +385,34 @@ public class Modeler implements Runnable {
 					continue;
 				}
 
-				// Add to list (and truncate to max size)
-				while (wifiScanList.size() >= params.wifiScanBufferSize) {
-					wifiScanList.remove(0);
+				// Replace the history atomically; readers never see list mutation.
+				dataModel.latestWifiScans
+					.compute(record.serialNumber, (serial, history) -> {
+						List<List<WifiScanEntry>> updated = new ArrayList<>();
+						if (history != null) {
+							updated.addAll(history);
+						}
+						updated.add(Collections.unmodifiableList(scanEntries));
+						int limit = Math.max(1, params.wifiScanBufferSize);
+						return Collections.unmodifiableList(
+							new ArrayList<>(
+								updated.subList(
+									Math.max(0, updated.size() - limit),
+									updated.size()
+								)
+							)
+						);
+					});
+				List<WifiScanEntry> snapshot = new ArrayList<>();
+				for (WifiScanEntry entry : scanEntries) {
+					snapshot.add(new WifiScanEntry(entry));
 				}
-				wifiScanList.add(scanEntries);
+				// Compare and publish atomically per device. Delayed events and
+				// equal-timestamp duplicates must not replace the latest batch.
+				latestScanBatches.compute(record.serialNumber, (serial, current) ->
+					current == null || record.timestampMs > current.timestampMs
+						? new WifiScanBatch(record.timestampMs, snapshot) : current
+				);
 				wifiScanUpdates.add(record.serialNumber);
 			}
 			break;
@@ -446,6 +495,7 @@ public class Modeler implements Runnable {
 
 	/** Revalidate the data model to remove any non-RRM-enabled devices. */
 	public void revalidate() {
+		latestScanBatches.keySet().removeIf(serial -> !isRRMEnabled(serial));
 		if (
 			dataModel.latestWifiScans.entrySet()
 				.removeIf(e -> !isRRMEnabled(e.getKey()))

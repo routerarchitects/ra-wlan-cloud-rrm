@@ -1,4 +1,4 @@
-name: Build Docker image
+name: RRM Maven CI
 
 on:
   push:
@@ -13,20 +13,63 @@ on:
     branches:
       - main
       - 'release/*'
+    types:
+      - opened
+      - synchronize
+      - reopened
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 defaults:
   run:
     shell: bash
 
 jobs:
+  maven:
+    name: Unit and Mock Integration Tests
+    runs-on: ubuntu-latest
+    concurrency:
+      # Superseded commits in the same PR do not need overlapping test jobs.
+      # Other branches/releases keep independent runs.
+      group: maven-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up JDK 11
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '11'
+        cache: maven
+    - name: Verify all Maven modules
+      run: mvn -B clean verify
+    - name: Retain JUnit results and failure diagnostics
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: maven-test-results
+        path: |
+          **/target/surefire-reports/**
+          **/target/failsafe-reports/**
+        if-no-files-found: warn
+        retention-days: 14
+
   docker:
-    runs-on: ubuntu-20.04
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/heads/release/') ||
+       startsWith(github.ref, 'refs/tags/v'))
+    needs: maven
+    runs-on: ubuntu-latest
     env:
       DOCKER_REGISTRY_URL: tip-tip-wlan-cloud-ucentral.jfrog.io
       DOCKER_REGISTRY_USERNAME: ucentral
     steps:
     - name: Checkout actions repo
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         repository: Telecominfraproject/.github
         path: github
@@ -52,12 +95,12 @@ jobs:
 
   trigger-deploy-to-dev:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs:
       - docker
     steps:
     - name: Checkout actions repo
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         repository: Telecominfraproject/.github
         path: github
